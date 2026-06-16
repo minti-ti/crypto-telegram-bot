@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: crypto-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: BLOCKCHAIR_API_KEY
+        sync: false
+      - key: COINGECKO_API_KEY
+        sync: false
+      - key: MORNING_TIME
+        value: "09:00"
+      - key: PORT
+        value: "8000"
