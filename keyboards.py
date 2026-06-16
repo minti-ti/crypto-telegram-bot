@@ -11,19 +11,17 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="💸 Funding", callback_data="cmd:funding"),
-        ],
-        [
-            InlineKeyboardButton(text="📰 Новости", callback_data="cmd:news"),
             InlineKeyboardButton(text="🏆 Топ", callback_data="cmd:top"),
         ],
         [
+            InlineKeyboardButton(text="📰 Новости", callback_data="cmd:news"),
             InlineKeyboardButton(text="🚨 Алерты", callback_data="cmd:alerts"),
-            InlineKeyboardButton(text="🔔 Подписки", callback_data="cmd:subs"),
         ],
         [
-            InlineKeyboardButton(text="📋 Сводка", callback_data="cmd:briefing"),
+            InlineKeyboardButton(text="🔔 Подписки", callback_data="cmd:subs"),
             InlineKeyboardButton(text="⚙️ Время", callback_data="cmd:settime"),
         ],
+        [InlineKeyboardButton(text="📋 Сводка", callback_data="cmd:briefing")],
     ])
 
 
@@ -44,17 +42,18 @@ def kb_price(symbol: str) -> InlineKeyboardMarkup:
 
 
 def kb_market() -> InlineKeyboardMarkup:
-    """Панель для /fg, /funding, /top, /briefing."""
+    """Панель для /fg, /funding, /top, /briefing.
+    📰 Новости — большая сверху. Funding — компактная как другие."""
     return InlineKeyboardMarkup(inline_keyboard=[
+        # Новости — на всю ширину
+        [InlineKeyboardButton(text="📰 Новости", callback_data="cmd:news")],
+        # Рыночные команды равные
         [
             InlineKeyboardButton(text="💰 Цена", callback_data="cmd:price"),
             InlineKeyboardButton(text="😱 F&G", callback_data="cmd:fg"),
             InlineKeyboardButton(text="💸 Funding", callback_data="cmd:funding"),
         ],
-        [
-            InlineKeyboardButton(text="🏆 Топ", callback_data="cmd:top"),
-            InlineKeyboardButton(text="📰 Новости", callback_data="cmd:news"),
-        ],
+        [InlineKeyboardButton(text="🏆 Топ", callback_data="cmd:top")],
         [InlineKeyboardButton(text="🏠 Меню", callback_data="cmd:menu")],
     ])
 
