@@ -697,20 +697,86 @@ async def check_alerts_job() -> None:
 
 
 async def check_news_job() -> None:
-    """Каждые 5 минут собирает RSS, фильтрует LLM, шлёт подписчикам."""
-    subs_by_coin = db.all_subs_by_coin()
+    """Каждые 5 минут проверяет RSS на НОВЫЕ новости, фильтрует LLM,
+    шлёт подписчикам. LLM вызывается ТОЛЬКО если есть новые URL
+    (экономит ~70% расходов)."""
+    subs_by_coin = await db.all_subs_by_coin()
     if not subs_by_coin:
         return
     target_coins = list(subs_by_coin.keys())
 
+    # 1. Скачиваем RSS
     raw = await services.fetch_rss_feeds(lookback_hours=24)
     if not raw:
         log.info("News job: no RSS items fetched")
         return
-    items = await services.filter_news_with_llm(raw, target_coins=target_coins)
-    if not items:
-        log.info("News job: nothing significant after filter")
+
+    # 2. Фильтруем только НОВЫЕ (URL которых ещё нет в БД)
+    new_items: list[dict] = []
+    for it in raw[: config.NEWS_MAX_PER_LLM]:
+        if not await db.is_news_sent(it["url"]):
+            new_items.append(it)
+
+    # 3. Если новых нет — выходим без вызова LLM
+    if not new_items:
+        log.info("News job: no new items, skipping LLM (saved API calls)")
         return
+
+    log.info("News job: %s new items, calling LLM", len(new_items))
+
+    # 4. Помечаем новые URL как seen ДО LLM (защита от дублей)
+    for it in new_items:
+        await db.mark_news_sent(it["url"])
+
+    # 5. LLM фильтрует ТОЛЬКО новые
+    items = await services.filter_news_with_llm(
+        new_items, target_coins=target_coins
+    )
+    if not items:
+        log.info("News job: LLM found nothing significant in %s new items",
+                 len(new_items))
+        return
+
+    # 6. Рассылаем подписчикам
+    sent_count = 0
+    for it in items:
+        url = it["url"]
+        target_users: set[int] = set()
+        for c in it.get("coins", []):
+            target_users.update(subs_by_coin.get(c, []))
+        if not it.get("coins"):
+            for users in subs_by_coin.values():
+                target_users.update(users)
+        if not target_users:
+            continue
+        title_orig = it["title"].replace("*", "").replace("`", "")
+        title_ru = (it.get("title_ru") or "").strip()
+        coins = it.get("coins", [])
+        coin_part = f" `[{' '.join(coins[:4])}]`" if coins else ""
+        fire = "🔥 " if it.get("importance") == "high" else ""
+        reason = it.get("reason", "").strip()
+        # Перевод на русский если есть
+        if title_ru and title_ru.lower() != title_orig.lower():
+            title_part = f"{title_ru}*\n  _{title_orig}_"
+        else:
+            title_part = f"{title_orig}*"
+        reason_part = f"\n_{reason}_" if reason else ""
+        source = it.get("source") or "source"
+        text = (
+            f"📰 {fire}*{title_part}{coin_part}{reason_part}\n"
+            f"[↗ {source}]({url})"
+        )
+        for uid in target_users:
+            try:
+                await bot.send_message(
+                    uid, text, disable_web_page_preview=True
+                )
+                sent_count += 1
+            except Exception as e:
+                log.warning("Failed to send news to %s: %s", uid, e)
+    log.info("News job: sent %s messages for %s significant items "
+             "(of %s new)",
+             sent_count, len(items), len(new_items))
 
     sent_count = 0
     for it in items:
