@@ -31,7 +31,7 @@ COINGECKO_API_KEY: str = _get("COINGECKO_API_KEY")
 # Если OPENROUTER_API_KEY не задан, бот рассылает все новости из RSS as-is.
 OPENROUTER_API_KEY: str = _get("OPENROUTER_API_KEY")
 OPENROUTER_MODEL: str = _get(
-    "OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"
+    "OPENROUTER_MODEL", "openai/gpt-oss-120b:free"
 )
 NEWS_RSS_FEEDS: list[str] = [
     u.strip() for u in _get(

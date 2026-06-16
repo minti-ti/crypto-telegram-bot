@@ -23,7 +23,10 @@ import db
 import services
 from keyboards import (
     main_menu_kb,
-    kb_price, kb_market, kb_news, kb_alerts, kb_settime,
+    kb_price, kb_market, kb_news_my_subs, kb_news_after,
+    kb_alerts_list, kb_alert_confirm,
+    kb_subs_current, kb_settime, kb_calc,
+    cancel_kb,
 )
 
 logging.basicConfig(
@@ -54,6 +57,23 @@ class AddAlert(StatesGroup):
 
 class ConvertState(StatesGroup):
     waiting_input = State()
+
+
+class NewsCustomCoin(StatesGroup):
+    waiting_coin = State()
+
+
+class SubCustomCoin(StatesGroup):
+    waiting_coin = State()
+
+
+class CalcState(StatesGroup):
+    side = State()
+    entry_price = State()
+    exit_price = State()
+    position_size = State()
+    leverage = State()
+    fee_percent = State()
 
 
 # ─────────────────────────── /start и меню ─────────────────────
@@ -123,7 +143,11 @@ async def cb_menu(c: types.CallbackQuery) -> None:
         await cmd_briefing(c.message)
         return
     if cmd == "menu":
-        await cmd_start(c.message)
+        await c.answer()
+        await c.message.answer(
+            "🏠 *Главное меню*",
+            reply_markup=main_menu_kb(),
+        )
         return
     if cmd == "news":
         await c.message.answer(
@@ -291,22 +315,142 @@ def _format_news_message(items: list[dict], coins_filter: list[str] | None = Non
 
 @router.message(Command("news"))
 async def cmd_news(m: types.Message, command: CommandObject) -> None:
-    currencies: list[str] | None = None
     if command.args:
         currencies = [
             c.strip().upper() for c in re.split(r"[,\s]+", command.args) if c.strip()
         ]
+        await _show_news(m, currencies)
+        return
+    # /news без аргументов — меню с подписками
+    subs = await db.get_user_subs(m.from_user.id)
+    await m.answer(
+        "📰 *Новости — выбери монету:*\n"
+        "_Твои подписки сверху. Если нужна другая — нажми 'Другая монета' снизу._",
+        reply_markup=kb_news_my_subs(subs),
+    )
+
+
+async def _show_news(m: types.Message, currencies: list[str]) -> None:
+    """Собрать новости и отправить."""
     await m.answer("⏳ Собираю новости...")
     raw = await services.fetch_rss_feeds(lookback_hours=24)
     if not raw:
         await m.answer(
-            "⚠️ Не удалось получить новости из RSS. Проверь интернет.",
-            reply_markup=kb_news(currencies),
+            "⚠️ Не удалось получить новости из RSS.",
+            reply_markup=kb_news_my_subs([]),
         )
         return
     items = await services.filter_news_with_llm(raw, target_coins=currencies)
     text = _format_news_message(items, currencies)
-    await m.answer(text, disable_web_page_preview=True, reply_markup=kb_news(currencies))
+    coin = currencies[0] if currencies and currencies[0] != "ALL" else None
+    if coin:
+        await m.answer(text, disable_web_page_preview=True,
+                       reply_markup=kb_news_after(coin))
+    else:
+        await m.answer(text, disable_web_page_preview=True,
+                       reply_markup=kb_news_my_subs([]))
+
+
+# ─────────────────────────── /oi (Open Interest) ────────────────
+async def _send_oi(m: types.Message, symbol: str) -> None:
+    """Показать Open Interest для монеты."""
+    sym = symbol.upper()
+    if not sym.endswith("USDT"):
+        sym += "USDT"
+    async with services._shared_session() as s:
+        result = await services.get_oi_change_24h(s, sym)
+    if not result:
+        await m.answer(
+            f"⚠️ Не удалось получить OI для `{sym}`.\n"
+            "_Возможно, Binance недоступен с этого региона._",
+            reply_markup=kb_market(),
+        )
+        return
+
+    coin = services.symbol_to_coin(sym)
+    current = result["current_oi"]
+    change = result["change"]
+    pct = result["change_pct"]
+    price = result.get("price")
+    change_usd = result.get("change_usd")
+
+    arrow = "🟢" if change >= 0 else "🔴"
+    price_str = f"${price:,.2f}" if price else "—"
+
+    # USD value of current OI
+    oi_usd = current * price if price else None
+    oi_usd_str = f" ({fmt_volume(oi_usd)})" if oi_usd else ""
+
+    msg = (
+        f"📊 *Open Interest — {coin}*\n\n"
+        f"Текущий OI: `{current:,.0f} {coin}`{oi_usd_str}\n"
+        f"Цена: `{price_str}`\n\n"
+        f"*{arrow} За 24ч:*\n"
+        f"Изменение: `{change:+,.0f} {coin}` ({pct:+.2f}%)\n"
+    )
+    if change_usd is not None:
+        msg += f"Изменение USD: `{change_usd:+,.0f}`\n"
+
+    msg += "\n_💡 Трактовка:_\n"
+    msg += "• Цена ↑ + OI ↑ = в рынок заходят деньги, тренд сильный\n"
+    msg += "• Цена ↑ + OI ↓ = шорт-сквиз, быстро выдохнется\n"
+    msg += "• Цена ↓ + OI ↑ = паника, шорты наращивают\n"
+    msg += "• Цена ↓ + OI ↓ = лонги закрываются"
+
+    await m.answer(msg, reply_markup=kb_market())
+
+
+@router.message(Command("oi"))
+async def cmd_oi(m: types.Message, command: CommandObject) -> None:
+    if not command.args:
+        # Показать для нескольких топ-монет
+        async with services._shared_session() as s:
+            results = await asyncio.gather(
+                *[services.get_oi_change_24h(s, sym)
+                  for sym in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]],
+                return_exceptions=True,
+            )
+        valid = [r for r in results if r and not isinstance(r, Exception)]
+        if not valid:
+            await m.answer(
+                "⚠️ Не удалось получить OI.\n_Возможно, Binance недоступен._",
+                reply_markup=kb_market(),
+            )
+            return
+        lines = ["📊 *Open Interest (топ-3):*\n"]
+        for r in valid:
+            coin = services.symbol_to_coin(r["current_oi_symbol"]) if "current_oi_symbol" in r else None
+        # У нас нет current_oi_symbol, вычислим из change_usd
+        # Проще — пересоберём
+        coins_data = {
+            "BTCUSDT": ("BTC", None),
+            "ETHUSDT": ("ETH", None),
+            "SOLUSDT": ("SOL", None),
+        }
+        idx = 0
+        for sym, (coin, _) in list(coins_data.items()):
+            if idx >= len(valid):
+                break
+            r = valid[idx]
+            idx += 1
+            arrow = "🟢" if r["change"] >= 0 else "🔴"
+            lines.append(
+                f"• *{coin}*: {arrow} `{r['change_pct']:+.2f}%` за 24ч"
+            )
+        lines.append("\n_Конкретная монета: `/oi BTC` или `/oi ETH`_")
+        await m.answer("\n".join(lines), reply_markup=kb_market())
+        return
+    await _send_oi(m, command.args.strip())
+
+
+@router.callback_query(F.data == "cmd:oi")
+async def cb_oi(c: types.CallbackQuery) -> None:
+    await c.answer()
+    # Без аргументов — показать топ-3
+    c.message.text = "/oi"
+    # Прокачиваем через fake CommandObject
+    from aiogram.filters import CommandObject
+    await cmd_oi(c.message, CommandObject(prefix="/", command="oi", args=None))
 
 
 # ─────────────────────────── /top ───────────────────────────────
@@ -661,7 +805,7 @@ async def morning_job() -> None:
 
 async def check_alerts_job() -> None:
     """Проверяет активные алерты каждые 30 секунд."""
-    alerts = db.active_alerts()
+    alerts = await db.active_alerts()
     if not alerts:
         return
     # группируем по символам, чтобы делать 1 запрос на символ
@@ -681,7 +825,7 @@ async def check_alerts_job() -> None:
                 )
                 if not hit:
                     continue
-                db.mark_triggered(a["id"])
+                await db.mark_triggered(a["id"])
                 coin = services.symbol_to_coin(sym)
                 arrow = "📈" if a["direction"] == "above" else "📉"
                 text = (
@@ -724,11 +868,12 @@ async def check_news_job() -> None:
 
     log.info("News job: %s new items, calling LLM", len(new_items))
 
-    # 4. Помечаем новые URL как seen ДО LLM (защита от дублей)
+    # 4. Помечаем все новые URL как seen ДО LLM. Это страховка от дублей,
+    #    если бот упадёт пока LLM отвечает. Повторно эти URL уже не возьмём.
     for it in new_items:
         await db.mark_news_sent(it["url"])
 
-    # 5. LLM фильтрует ТОЛЬКО новые
+    # 5. LLM фильтрует ТОЛЬКО новые (не все 30, а только новые)
     items = await services.filter_news_with_llm(
         new_items, target_coins=target_coins
     )
@@ -777,45 +922,6 @@ async def check_news_job() -> None:
     log.info("News job: sent %s messages for %s significant items "
              "(of %s new)",
              sent_count, len(items), len(new_items))
-
-    sent_count = 0
-    for it in items:
-        url = it["url"]
-        if db.is_news_sent(url):
-            continue
-        # для каждой монеты в новости ищем подписчиков
-        target_users: set[int] = set()
-        for c in it.get("coins", []):
-            target_users.update(subs_by_coin.get(c, []))
-        # если монеты не указаны — шлём всем подписчикам (общая новость)
-        if not it.get("coins"):
-            for users in subs_by_coin.values():
-                target_users.update(users)
-        if not target_users:
-            continue
-        title = it["title"].replace("*", "").replace("`", "")
-        coins = it.get("coins", [])
-        coin_part = f" `[{' '.join(coins[:4])}]`" if coins else ""
-        fire = "🔥 " if it.get("importance") == "high" else ""
-        reason = it.get("reason", "").strip()
-        reason_part = f"\n_{reason}_" if reason else ""
-        source = it.get("source") or "source"
-        text = (
-            f"📰 {fire}*{title}*{coin_part}{reason_part}\n"
-            f"[↗ {source}]({url})"
-        )
-        for uid in target_users:
-            try:
-                await bot.send_message(
-                    uid, text, disable_web_page_preview=True
-                )
-                sent_count += 1
-            except Exception as e:
-                log.warning("Failed to send news to %s: %s", uid, e)
-        db.mark_news_sent(url)
-    if sent_count:
-        log.info("News job: sent %s messages for %s items",
-                 sent_count, len(items))
 
 
 async def setup_scheduler() -> AsyncIOScheduler:
@@ -972,6 +1078,390 @@ async def start_health_server() -> web.AppRunner | None:
     except Exception as e:
         log.warning("Health server failed: %s (non-fatal)", e)
         return None
+
+
+# ─────────────────────────── News callbacks ────────────────────
+@router.callback_query(F.data.startswith("news:"))
+async def cb_news_coin(c: types.CallbackQuery, state: FSMContext) -> None:
+    """Обработка кнопок новостей: news:BTC, news:ETH, news:ALL, news:custom."""
+    await c.answer()
+    coin = c.data.split(":", 1)[1].upper()
+    if coin == "CUSTOM":
+        await state.set_state(NewsCustomCoin.waiting_coin)
+        await c.message.answer(
+            "✏️ *Введи тикер монеты* (например `BTC`, `ETH`, `SOL`):",
+            reply_markup=cancel_kb(),
+        )
+        return
+    # ALL — все новости без фильтра
+    if coin == "ALL":
+        await _show_news(c.message, [])
+        return
+    await _show_news(c.message, [coin])
+
+
+@router.message(NewsCustomCoin.waiting_coin)
+async def news_custom_coin(m: types.Message, state: FSMContext) -> None:
+    await state.clear()
+    coin = m.text.strip().upper()
+    if not coin or not coin.isalpha():
+        await m.answer("❌ Не похоже на тикер. Попробуй ещё раз, например `BTC`")
+        return
+    await _show_news(m, [coin])
+
+
+# ─────────────────────────── Subscribe callbacks ────────────────
+@router.callback_query(F.data.startswith("sub:"))
+async def cb_sub_coin(c: types.CallbackQuery, state: FSMContext) -> None:
+    """Кнопки подписки: sub:BTC, sub:ETH, sub:SOL, sub:custom."""
+    coin = c.data.split(":", 1)[1].upper()
+    if coin == "CUSTOM":
+        await state.set_state(SubCustomCoin.waiting_coin)
+        await c.answer()
+        await c.message.answer(
+            "✏️ *Введи тикер монеты* для подписки:",
+            reply_markup=cancel_kb(),
+        )
+        return
+    added = await db.add_subs(c.from_user.id, [coin])
+    subs = await db.get_user_subs(c.from_user.id)
+    await c.answer(f"✅ Подписка на {coin}")
+    await c.message.edit_text(
+        f"✅ Подписка на *{coin}* активна.\n"
+        f"Всего подписок: {len(subs)}.",
+        reply_markup=kb_subs_current(subs),
+    )
+
+
+@router.message(SubCustomCoin.waiting_coin)
+async def sub_custom_coin(m: types.Message, state: FSMContext) -> None:
+    await state.clear()
+    coin = m.text.strip().upper()
+    if not coin or not coin.isalpha():
+        await m.answer("❌ Не похоже на тикер. Попробуй ещё раз:")
+        return
+    await db.add_subs(m.from_user.id, [coin])
+    subs = await db.get_user_subs(m.from_user.id)
+    await m.answer(
+        f"✅ Подписка на *{coin}* активна.\n"
+        f"Всего подписок: {len(subs)}.",
+        reply_markup=kb_subs_current(subs),
+    )
+
+
+@router.callback_query(F.data.startswith("unsub:"))
+async def cb_unsub_coin(c: types.CallbackQuery) -> None:
+    """Кнопка отписки."""
+    coin = c.data.split(":", 1)[1].upper()
+    await db.remove_subs(c.from_user.id, [coin])
+    subs = await db.get_user_subs(c.from_user.id)
+    await c.answer(f"🗑 Отписался от {coin}")
+    await c.message.edit_text(
+        f"🗑 Отписался от *{coin}*.\nОсталось подписок: {len(subs)}",
+        reply_markup=kb_subs_current(subs),
+    )
+
+
+# ─────────────────────────── Alert delete callbacks ────────────
+@router.callback_query(F.data.startswith("alert:del:"))
+async def cb_alert_delete(c: types.CallbackQuery) -> None:
+    alert_id = int(c.data.split(":")[2])
+    if await db.delete_alert(c.from_user.id, alert_id):
+        await c.answer(f"🗑 Алерт #{alert_id} удалён")
+        # Обновим список
+        rows = await db.list_user_alerts(c.from_user.id)
+        alerts = [dict(r) for r in rows]
+        if alerts:
+            lines = ["🚨 *Твои алерты:*\nНажми 🗑 чтобы удалить."]
+            for a in alerts:
+                status = "✅ сработал" if a["triggered"] else "⏳ активен"
+                coin = services.symbol_to_coin(a["symbol"])
+                arrow = "📈" if a["direction"] == "above" else "📉"
+                lines.append(
+                    f"{arrow} *#{a['id']}* `{coin}` {a['direction']} {a['price']:g} — {status}"
+                )
+            await c.message.edit_text(
+                "\n".join(lines),
+                reply_markup=kb_alerts_list(alerts),
+            )
+        else:
+            await c.message.edit_text(
+                "🚨 *Алерты*\n\nУ тебя больше нет алертов.",
+                reply_markup=kb_alerts_list([]),
+            )
+    else:
+        await c.answer("❌ Не удалось удалить")
+
+
+@router.callback_query(F.data == "alert:noop")
+async def cb_alert_noop(c: types.CallbackQuery) -> None:
+    """Заглушка для неактивной кнопки-информации."""
+    await c.answer()
+
+
+# ─────────────────────────── Калькулятор сделки ──────────────────
+# FSM для risk-management калькулятора
+class RiskCalc(StatesGroup):
+    side = State()           # long/short
+    deposit = State()        # депозит в USD
+    risk_pct = State()       # риск на сделку в %
+    entry = State()          # цена входа
+    stop = State()           # стоп-лосс
+    take = State()           # тейк-профит
+    leverage = State()       # плечо (опционально)
+    fee_pct = State()        # комиссия биржи (опционально)
+
+
+@router.message(Command("calc"))
+async def cmd_calc(m: types.Message) -> None:
+    await m.answer(
+        "📊 *Калькулятор позиции (Risk Management)*\n\n"
+        "Задай риск → получи размер позиции автоматически.\n\n"
+        "Выбери сторону:",
+        reply_markup=kb_calc(),
+    )
+
+
+@router.callback_query(F.data == "cmd:calc")
+async def cb_calc_menu(c: types.CallbackQuery) -> None:
+    await c.answer()
+    await c.message.answer(
+        "📊 *Калькулятор позиции*\n\nВыбери сторону:",
+        reply_markup=kb_calc(),
+    )
+
+
+@router.callback_query(F.data.startswith("calc:"))
+async def cb_calc_side(c: types.CallbackQuery, state: FSMContext) -> None:
+    side = c.data.split(":")[1]
+    await state.set_state(RiskCalc.deposit)
+    await state.update_data(side=side)
+    await c.answer()
+    arrow = "🟢 Лонг" if side == "long" else "🔴 Шорт"
+    await c.message.answer(
+        f"📊 Калькулятор: *{arrow}*\n\n"
+        "Введи *размер депозита в USD*:\n"
+        "_(сколько у тебя всего на бирже)_",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(RiskCalc.deposit)
+async def risk_deposit(m: types.Message, state: FSMContext) -> None:
+    try:
+        v = float(m.text.replace(",", ".").replace(" ", ""))
+        if v <= 0:
+            raise ValueError
+    except ValueError:
+        await m.answer("❌ Введи положительное число, например `1000`:")
+        return
+    await state.update_data(deposit=v)
+    await state.set_state(RiskCalc.risk_pct)
+    await m.answer("Сколько *% риска на сделку*?\n_(обычно 0.5–2%)_")
+
+
+@router.message(RiskCalc.risk_pct)
+async def risk_pct(m: types.Message, state: FSMContext) -> None:
+    try:
+        v = float(m.text.replace(",", ".").replace(" ", ""))
+        if v <= 0 or v > 100:
+            raise ValueError
+    except ValueError:
+        await m.answer("❌ Введи % от 0 до 100, обычно `1`:")
+        return
+    await state.update_data(risk_pct=v)
+    await state.set_state(RiskCalc.entry)
+    await m.answer("Введи *цену входа*:\n_(например `64270`)_")
+
+
+@router.message(RiskCalc.entry)
+async def risk_entry(m: types.Message, state: FSMContext) -> None:
+    try:
+        v = float(m.text.replace(",", ".").replace(" ", ""))
+        if v <= 0:
+            raise ValueError
+    except ValueError:
+        await m.answer("❌ Введи положительное число:")
+        return
+    await state.update_data(entry=v)
+    await state.set_state(RiskCalc.stop)
+    await m.answer("Введи *цену стоп-лосса*:\n_(где закрываешь убыточную сделку)_")
+
+
+@router.message(RiskCalc.stop)
+async def risk_stop(m: types.Message, state: FSMContext) -> None:
+    try:
+        v = float(m.text.replace(",", ".").replace(" ", ""))
+        if v <= 0:
+            raise ValueError
+    except ValueError:
+        await m.answer("❌ Введи положительное число:")
+        return
+    data = await state.get_data()
+    # Для шорта стоп должен быть ВЫШЕ входа
+    if data["side"] == "long" and v >= data["entry"]:
+        await m.answer("❌ Для лонга стоп должен быть НИЖЕ входа. Попробуй ещё:")
+        return
+    if data["side"] == "short" and v <= data["entry"]:
+        await m.answer("❌ Для шорта стоп должен быть ВЫШЕ входа. Попробуй ещё:")
+        return
+    await state.update_data(stop=v)
+    await state.set_state(RiskCalc.take)
+    await m.answer("Введи *тейк-профит* (TP):\n_(где фиксируешь прибыль)_")
+
+
+@router.message(RiskCalc.take)
+async def risk_take(m: types.Message, state: FSMContext) -> None:
+    try:
+        v = float(m.text.replace(",", ".").replace(" ", ""))
+        if v <= 0:
+            raise ValueError
+    except ValueError:
+        await m.answer("❌ Введи положительное число:")
+        return
+    data = await state.get_data()
+    # Проверяем что TP в правильную сторону
+    if data["side"] == "long" and v <= data["entry"]:
+        await m.answer("❌ Для лонга TP должен быть ВЫШЕ входа. Попробуй ещё:")
+        return
+    if data["side"] == "short" and v >= data["entry"]:
+        await m.answer("❌ Для шорта TP должен быть НИЖЕ входа. Попробуй ещё:")
+        return
+    await state.update_data(take=v)
+    await state.set_state(RiskCalc.leverage)
+    await m.answer(
+        "Введи *плечо* (или `1` для спота, `10` для 10x и т.п.):"
+    )
+
+
+@router.message(RiskCalc.leverage)
+async def risk_leverage(m: types.Message, state: FSMContext) -> None:
+    try:
+        v = float(m.text.replace(",", ".").replace(" ", ""))
+        if v <= 0:
+            raise ValueError
+    except ValueError:
+        await m.answer("❌ Введи положительное число:")
+        return
+    await state.update_data(leverage=v)
+    await state.set_state(RiskCalc.fee_pct)
+    await m.answer(
+        "Введи *комиссию биржи в %* (например `0.1` для Binance, "
+        "`0.04` для Bybit, `0` если без):"
+    )
+
+
+@router.message(RiskCalc.fee_pct)
+async def risk_fee(m: types.Message, state: FSMContext) -> None:
+    try:
+        fee = float(m.text.replace(",", ".").replace(" ", ""))
+        if fee < 0:
+            raise ValueError
+    except ValueError:
+        await m.answer("❌ Введи число (можно 0):")
+        return
+
+    data = await state.get_data()
+    await state.clear()
+
+    deposit = data["deposit"]
+    risk_pct = data["risk_pct"]
+    entry = data["entry"]
+    stop = data["stop"]
+    take = data["take"]
+    leverage = data["leverage"]
+    side = data["side"]
+
+    # === Расчёты (по таблице пользователя) ===
+    risk_usd = deposit * (risk_pct / 100)
+
+    # Размер стопа в %
+    if side == "long":
+        stop_pct = (entry - stop) / entry * 100
+        take_pct = (take - entry) / entry * 100
+    else:  # short
+        stop_pct = (stop - entry) / entry * 100
+        take_pct = (entry - take) / entry * 100
+
+    # Объём позиции (не маржа!) — это полный размер позиции = риск / стоп%
+    if stop_pct > 0:
+        position_value = risk_usd / (stop_pct / 100)
+    else:
+        position_value = 0
+
+    # Размер в монетах для биржи
+    qty = position_value / entry
+
+    # Маржа = объём позиции / плечо
+    margin = position_value / leverage
+
+    # Потенциальная прибыль (gross)
+    if side == "long":
+        gross_profit = (take - entry) * qty
+    else:
+        gross_profit = (entry - take) * qty
+
+    gross_profit_pct = (gross_profit / position_value) * 100 if position_value else 0
+
+    # Комиссии (открытие + закрытие)
+    fee_amount = position_value * (fee / 100) * 2
+
+    net_profit = gross_profit - fee_amount
+    net_profit_pct = (net_profit / margin) * 100 if margin else 0
+
+    # R:R (Reward / Risk)
+    rr_ratio = (gross_profit / risk_usd) if risk_usd > 0 else 0
+
+    # Цена ликвидации (грубо)
+    if leverage > 1:
+        if side == "long":
+            liq_price = entry * (1 - 1/leverage + 0.005)
+        else:
+            liq_price = entry * (1 + 1/leverage - 0.005)
+    else:
+        liq_price = None
+
+    # === Форматирование результата ===
+    side_label = "🟢 Лонг" if side == "long" else "🔴 Шорт"
+    arrow_p = "💰" if net_profit >= 0 else "💸"
+
+    rr_text = f"{rr_ratio:.2f}"
+    if rr_ratio >= 2:
+        rr_emoji = "🟢"
+    elif rr_ratio >= 1.5:
+        rr_emoji = "🟡"
+    else:
+        rr_emoji = "🔴"
+
+    liq_text = f"`{liq_price:,.2f}`" if liq_price else "_нет (спот)_"
+
+    msg = (
+        f"📊 *Калькулятор позиции* — {side_label}\n\n"
+        f"📥 *Вводные:*\n"
+        f"Депозит: `{deposit:,.2f} USD`\n"
+        f"Риск на сделку: `{risk_pct}%` = `{risk_usd:,.2f} USD`\n"
+        f"Плечо: `x{leverage:g}`\n"
+        f"Комиссия: `{fee}%` × 2 стороны\n\n"
+        f"🎯 *Сделка:*\n"
+        f"Вход: `{entry:,.2f}`\n"
+        f"Стоп-лосс: `{stop:,.2f}` ({stop_pct:.2f}% от входа)\n"
+        f"Тейк-профит: `{take:,.2f}` ({take_pct:.2f}% от входа)\n"
+        f"R:R (Reward/Risk): {rr_emoji} `{rr_text}`\n\n"
+        f"💼 *Расчёт позиции:*\n"
+        f"Маржа: `{margin:,.2f} USD`\n"
+        f"Объём позиции: `{position_value:,.2f} USD`\n"
+        f"Размер в монетах: `{qty:.6f}`\n"
+        f"⚠️ Ликвидация: {liq_text}\n\n"
+        f"📈 *Результат:*\n"
+        f"Gross прибыль: `{gross_profit:+,.2f} USD` ({gross_profit_pct:+.2f}%)\n"
+        f"Комиссии: `{fee_amount:,.2f} USD`\n"
+        f"{arrow_p} *Net прибыль: `{net_profit:+,.2f} USD`*\n"
+        f"ROI от маржи: `{net_profit_pct:+.2f}%`\n\n"
+        f"_Расчёт приблизительный. Реальная комиссия и ликвидация зависят от биржи._"
+    )
+
+    from keyboards import kb_market
+    await m.answer(msg, reply_markup=kb_market())
 
 
 async def on_startup() -> None:

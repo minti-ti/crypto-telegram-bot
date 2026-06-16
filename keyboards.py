@@ -1,4 +1,5 @@
-"""Inline-кнопки для бота: главное меню + контекстные панели для каждой команды."""
+"""Inline-кнопки: главное меню + контекстные панели для каждой команды.
+Все подменю — максимально на кнопках, минимум текста."""
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
@@ -6,28 +7,31 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
+            InlineKeyboardButton(text="📰 Новости", callback_data="cmd:news"),
+        ],
+        [
             InlineKeyboardButton(text="💰 Цена", callback_data="cmd:price"),
             InlineKeyboardButton(text="😱 F&G", callback_data="cmd:fg"),
         ],
         [
             InlineKeyboardButton(text="💸 Funding", callback_data="cmd:funding"),
+            InlineKeyboardButton(text="📊 OI", callback_data="cmd:oi"),
             InlineKeyboardButton(text="🏆 Топ", callback_data="cmd:top"),
         ],
         [
-            InlineKeyboardButton(text="📰 Новости", callback_data="cmd:news"),
             InlineKeyboardButton(text="🚨 Алерты", callback_data="cmd:alerts"),
+            InlineKeyboardButton(text="🔔 Подписки", callback_data="cmd:subs"),
         ],
         [
-            InlineKeyboardButton(text="🔔 Подписки", callback_data="cmd:subs"),
-            InlineKeyboardButton(text="⚙️ Время", callback_data="cmd:settime"),
+            InlineKeyboardButton(text="📊 Калькулятор", callback_data="cmd:calc"),
+            InlineKeyboardButton(text="📋 Сводка", callback_data="cmd:briefing"),
         ],
-        [InlineKeyboardButton(text="📋 Сводка", callback_data="cmd:briefing")],
+        [InlineKeyboardButton(text="⚙️ Время сводки", callback_data="cmd:settime")],
     ])
 
 
-# ─────────────────────────── контекстные панели ─────────────────
+# ─────────────────────────── /price ──────────────────────────────
 def kb_price(symbol: str) -> InlineKeyboardMarkup:
-    """Панель для /price <symbol>."""
     coin = _symbol_to_coin(symbol)
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -41,63 +45,122 @@ def kb_price(symbol: str) -> InlineKeyboardMarkup:
     ])
 
 
+# ─────────────────────────── /fg /funding /top /briefing ─────────
 def kb_market() -> InlineKeyboardMarkup:
-    """Панель для /fg, /funding, /top, /briefing.
-    📰 Новости — большая сверху. Funding — компактная как другие."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        # Новости — на всю ширину
         [InlineKeyboardButton(text="📰 Новости", callback_data="cmd:news")],
-        # Рыночные команды равные
         [
             InlineKeyboardButton(text="💰 Цена", callback_data="cmd:price"),
             InlineKeyboardButton(text="😱 F&G", callback_data="cmd:fg"),
             InlineKeyboardButton(text="💸 Funding", callback_data="cmd:funding"),
         ],
+        [InlineKeyboardButton(text="📊 Open Interest", callback_data="cmd:oi")],
         [InlineKeyboardButton(text="🏆 Топ", callback_data="cmd:top")],
         [InlineKeyboardButton(text="🏠 Меню", callback_data="cmd:menu")],
     ])
 
 
-def kb_news(coins: list[str] | None = None) -> InlineKeyboardMarkup:
-    """Панель для /news, /subscribe, /mysubs."""
+# ─────────────────────────── /news ──────────────────────────────
+def kb_news_my_subs(coins: list[str]) -> InlineKeyboardMarkup:
+    """Панель новостей: твои подписки как кнопки + 'Другая монета'."""
+    rows: list[list[InlineKeyboardButton]] = []
     if coins:
-        first_row = [
-            InlineKeyboardButton(
-                text=f"🔔 Подписаться на {c}", callback_data=f"sub:{c}"
-            )
-            for c in coins[:3]
-        ]
-        rows = []
-        if first_row:
-            rows.append(first_row)
+        # Кнопки с подписками — по 3 в ряд
+        for i in range(0, len(coins), 3):
+            chunk = coins[i:i+3]
+            rows.append([
+                InlineKeyboardButton(text=c, callback_data=f"news:{c}")
+                for c in chunk
+            ])
         rows.append([
-            InlineKeyboardButton(text="🔔 Мои подписки", callback_data="cmd:subs"),
-            InlineKeyboardButton(text="💰 Цена", callback_data="cmd:price"),
+            InlineKeyboardButton(text="📋 Все новости (без фильтра)", callback_data="news:ALL"),
         ])
-        rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="cmd:menu")])
-        return InlineKeyboardMarkup(inline_keyboard=rows)
+    else:
+        rows.append([
+            InlineKeyboardButton(text="🔔 У меня нет подписок — добавить", callback_data="cmd:subs"),
+        ])
+    rows.append([
+        InlineKeyboardButton(text="✏️ Другая монета", callback_data="news:custom"),
+    ])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="cmd:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_news_after(coin: str) -> InlineKeyboardMarkup:
+    """Панель ПОСЛЕ получения новостей по монете."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🔔 Подписки", callback_data="cmd:subs"),
-            InlineKeyboardButton(text="💰 Цена", callback_data="cmd:price"),
+            InlineKeyboardButton(text="🔔 Подписаться", callback_data=f"sub:{coin}"),
+            InlineKeyboardButton(text="✏️ Другая монета", callback_data="news:custom"),
         ],
         [InlineKeyboardButton(text="🏠 Меню", callback_data="cmd:menu")],
     ])
 
 
-def kb_alerts() -> InlineKeyboardMarkup:
-    """Панель для /alerts, /delalert."""
+# ─────────────────────────── /alerts ────────────────────────────
+def kb_alerts_list(alerts: list) -> InlineKeyboardMarkup:
+    """Список алертов с inline-кнопками удаления."""
+    rows: list[list[InlineKeyboardButton]] = []
+    if not alerts:
+        rows.append([
+            InlineKeyboardButton(text="➕ Создать первый алерт", callback_data="alert:start"),
+        ])
+    else:
+        for a in alerts:
+            coin = _symbol_to_coin(a["symbol"]) if isinstance(a, dict) else a[1]
+            direction = a["direction"] if isinstance(a, dict) else a[2]
+            price = a["price"] if isinstance(a, dict) else a[3]
+            triggered = a["triggered"] if isinstance(a, dict) else a[4]
+            alert_id = a["id"] if isinstance(a, dict) else a[0]
+            status = "✅" if triggered else "⏳"
+            arrow = "📈" if direction == "above" else "📉"
+            label = f"{status}{arrow} {coin} {direction} {price:g}"
+            rows.append([
+                InlineKeyboardButton(text=label, callback_data=f"alert:noop"),
+                InlineKeyboardButton(text="🗑", callback_data=f"alert:del:{alert_id}"),
+            ])
+        rows.append([
+            InlineKeyboardButton(text="➕ Добавить алерт", callback_data="alert:start"),
+        ])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="cmd:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_alert_confirm(symbol: str, direction: str, price: float, alert_id: int) -> InlineKeyboardMarkup:
+    """Подтверждение после создания алерта."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="➕ Создать алерт", callback_data="alert:start"),
-            InlineKeyboardButton(text="💰 Цена", callback_data="cmd:price"),
+            InlineKeyboardButton(text="📋 Все алерты", callback_data="cmd:alerts"),
+            InlineKeyboardButton(text="➕ Ещё один", callback_data="alert:start"),
         ],
         [InlineKeyboardButton(text="🏠 Меню", callback_data="cmd:menu")],
     ])
 
 
+# ─────────────────────────── /subscribe /mysubs ──────────────────
+def kb_subs_current(coins: list[str]) -> InlineKeyboardMarkup:
+    """Управление подписками на новости."""
+    rows: list[list[InlineKeyboardButton]] = []
+    if coins:
+        rows.append([InlineKeyboardButton(text="─── Твои подписки ───", callback_data="noop")])
+        for c in coins:
+            rows.append([
+                InlineKeyboardButton(text=f"🗑 Отписаться от {c}", callback_data=f"unsub:{c}"),
+            ])
+    rows.append([
+        InlineKeyboardButton(text="➕ Подписаться на BTC", callback_data="sub:BTC"),
+        InlineKeyboardButton(text="➕ ETH", callback_data="sub:ETH"),
+        InlineKeyboardButton(text="➕ SOL", callback_data="sub:SOL"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="✏️ Другая монета", callback_data="sub:custom"),
+    ])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="cmd:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ─────────────────────────── /settime ────────────────────────────
 def kb_settime(current: str) -> InlineKeyboardMarkup:
-    """Панель для /settime — кнопки быстрого выбора."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="⏰ 07:00", callback_data="settime:07:00"),
@@ -113,13 +176,25 @@ def kb_settime(current: str) -> InlineKeyboardMarkup:
     ])
 
 
-# ─────────────────────────── утилиты ────────────────────────────
+# ─────────────────────────── Калькулятор сделки ──────────────────
+def kb_calc() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🟢 Лонг (Long)", callback_data="calc:long"),
+            InlineKeyboardButton(text="🔴 Шорт (Short)", callback_data="calc:short"),
+        ],
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="cmd:menu")],
+    ])
+
+
+# ─────────────────────────── FSM helper ──────────────────────────
 def cancel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")]
     ])
 
 
+# ─────────────────────────── helpers ─────────────────────────────
 def _symbol_to_coin(symbol: str) -> str:
     s = symbol.upper()
     for suf in ("USDT", "USDC", "BUSD", "FDUSD", "BTC", "ETH"):
