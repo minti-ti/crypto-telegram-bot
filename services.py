@@ -565,6 +565,11 @@ US_ECON_KEYWORDS = (
     "INFLATION", "RETAIL SALES", "INDUSTRIAL PRODUCTION",
 )
 
+HIGH_IMPACT_KEYWORDS = (
+    "CPI", "NFP", "NONFARM", "FOMC", "FED INTEREST RATE", "GDP", "PPI",
+    "UNEMPLOYMENT RATE", "RETAIL SALES", "CORE RETAIL SALES",
+)
+
 
 async def fetch_economic_calendar(
     session: aiohttp.ClientSession,
@@ -672,6 +677,53 @@ async def fetch_mql5_calendar(
     return out
 
 
+def _is_high_impact_event(name: str) -> bool:
+    """Только самые важные макро-события."""
+    n = name.upper()
+    return any(k in n for k in HIGH_IMPACT_KEYWORDS)
+
+
+async def _translate_events(events: list[dict]) -> list[dict]:
+    """Переводит названия событий на русский через Google Translate."""
+    if not _HAS_TRANSLATOR:
+        return events
+    try:
+        loop = asyncio.get_running_loop()
+        names = [e.get("event", "") for e in events]
+        # Пробуем пакетный перевод
+        try:
+            translated = await loop.run_in_executor(
+                None,
+                lambda: GoogleTranslator(source="auto", target="ru").translate_batch(names),
+            )
+        except Exception:
+            translated = []
+            for n in names:
+                try:
+                    tr = await loop.run_in_executor(
+                        None,
+                        lambda txt=n: GoogleTranslator(source="auto", target="ru").translate(txt),
+                    )
+                    translated.append(tr)
+                except Exception:
+                    translated.append(n)
+        for e, tr in zip(events, translated):
+            if tr and tr.strip():
+                e["event_ru"] = tr.strip()
+    except Exception as e:
+        log.warning("Event translation failed: %s", e)
+    return events
+
+
+def _format_event_time_msk(e: dict) -> str:
+    """Время события в московском часовом поясе (UTC+3)."""
+    dt = _parse_event_datetime(e)
+    if not dt:
+        return "TBA"
+    msk = dt + timedelta(hours=3)
+    return msk.strftime("%H:%M MSK")
+
+
 def _filter_us_macro_events(events: list[dict]) -> list[dict]:
     """Оставляем только US macro events, которые влияют на рынок."""
     out: list[dict] = []
@@ -729,14 +781,14 @@ def _event_id(e: dict) -> str:
 
 
 def _fmt_event(e: dict) -> str:
-    event = e.get("event", "")
-    time_s = e.get("time") or "TBA"
+    event = e.get("event_ru") or e.get("event", "")
+    time_s = _format_event_time_msk(e)
     actual = e.get("actual")
     estimate = e.get("estimate")
     previous = e.get("previous")
     impact = (e.get("impact") or "").lower()
     emoji = "🔥" if impact == "3" or impact == "high" else "⚡" if impact == "2" or impact == "medium" else "•"
-    parts = [f"{emoji} *{event}* — `{time_s} UTC`"]
+    parts = [f"{emoji} *{event}* — `{time_s}`"]
     vals = []
     if estimate is not None:
         vals.append(f"прогноз `{estimate}`")
@@ -749,19 +801,27 @@ def _fmt_event(e: dict) -> str:
     return "\n".join(parts)
 
 
+
+
 async def build_econ_calendar_text(days: int = 1) -> str:
-    """Собрать текст календаря на ближайшие дни."""
-    today = datetime.now(timezone.utc)
-    from_date = today.strftime("%Y-%m-%d")
-    to_date = (today + timedelta(days=days)).strftime("%Y-%m-%d")
+    """Собрать текст календаря на ближайшие дни: предстоящие, важные, на русском, MSK."""
+    now = datetime.now(timezone.utc)
+    from_date = now.strftime("%Y-%m-%d")
+    to_date = (now + timedelta(days=days)).strftime("%Y-%m-%d")
     async with _shared_session() as s:
         events = await fetch_economic_calendar(s, from_date, to_date)
-    log.info("Calendar: raw events %s, filtered US events %s", len(events), 0)
     events = _filter_us_macro_events(events)
-    log.info("Calendar: filtered US events %s", len(events))
+    # Только предстоящие
+    events = [e for e in events if _parse_event_datetime(e) and _parse_event_datetime(e) > now]
+    # Только самые важные
+    events = [e for e in events if _is_high_impact_event(e.get("event", ""))]
     if not events:
-        return "📅 *Экономический календарь*\n\nНет важных US-событий на ближайшие дни."
-    lines = [f"📅 *Экономический календарь (US)*\n_Время UTC_\n"]
+        return "📅 *Нет важных предстоящих US-событий на ближайшие дни.*"
+    # Сортировка по времени
+    events.sort(key=lambda e: _parse_event_datetime(e) or datetime.min.replace(tzinfo=timezone.utc))
+    # Перевод на русский
+    events = await _translate_events(events)
+    lines = [f"📅 *Важные предстоящие US-события (MSK)*\n"]
     for e in events[:20]:
         lines.append(_fmt_event(e))
     return "\n\n".join(lines)
@@ -963,7 +1023,9 @@ async def build_morning_briefing() -> str:
 
     if cal_events:
         us_events = _filter_us_macro_events(cal_events)
+        us_events = [e for e in us_events if _is_high_impact_event(e.get("event", ""))]
         if us_events:
+            us_events = await _translate_events(us_events)
             lines.append("📅 *Важные US-события сегодня:*")
             for e in us_events[:5]:
                 lines.append(_fmt_event(e))
