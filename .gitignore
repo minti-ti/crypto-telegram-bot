@@ -30,4 +30,7 @@ Thumbs.db
 # Bot-specific
 bot.db
 downloads/
-download/
+download/bot.py.fixed
+bot.py.orig
+download
+download (1)
