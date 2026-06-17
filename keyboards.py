@@ -7,26 +7,28 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
+            InlineKeyboardButton(text="📊 Калькулятор позиции", callback_data="cmd:calc"),
+        ],
+        [
             InlineKeyboardButton(text="📰 Новости", callback_data="cmd:news"),
-        ],
-        [
             InlineKeyboardButton(text="💰 Цена", callback_data="cmd:price"),
-            InlineKeyboardButton(text="😱 F&G", callback_data="cmd:fg"),
         ],
         [
+            InlineKeyboardButton(text="😱 F&G", callback_data="cmd:fg"),
             InlineKeyboardButton(text="💸 Funding", callback_data="cmd:funding"),
             InlineKeyboardButton(text="📊 OI", callback_data="cmd:oi"),
+        ],
+        [
             InlineKeyboardButton(text="🏆 Топ", callback_data="cmd:top"),
+            InlineKeyboardButton(text="📋 Сводка", callback_data="cmd:briefing"),
         ],
         [
             InlineKeyboardButton(text="🚨 Алерты", callback_data="cmd:alerts"),
             InlineKeyboardButton(text="🔔 Подписки", callback_data="cmd:subs"),
         ],
         [
-            InlineKeyboardButton(text="📊 Калькулятор", callback_data="cmd:calc"),
-            InlineKeyboardButton(text="📋 Сводка", callback_data="cmd:briefing"),
+            InlineKeyboardButton(text="⚙️ Время сводки", callback_data="cmd:settime"),
         ],
-        [InlineKeyboardButton(text="⚙️ Время сводки", callback_data="cmd:settime")],
     ])
 
 
@@ -46,18 +48,13 @@ def kb_price(symbol: str) -> InlineKeyboardMarkup:
 
 
 # ─────────────────────────── /fg /funding /top /briefing ─────────
-def kb_market() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📰 Новости", callback_data="cmd:news")],
-        [
-            InlineKeyboardButton(text="💰 Цена", callback_data="cmd:price"),
-            InlineKeyboardButton(text="😱 F&G", callback_data="cmd:fg"),
-            InlineKeyboardButton(text="💸 Funding", callback_data="cmd:funding"),
-        ],
-        [InlineKeyboardButton(text="📊 Open Interest", callback_data="cmd:oi")],
-        [InlineKeyboardButton(text="🏆 Топ", callback_data="cmd:top")],
-        [InlineKeyboardButton(text="🏠 Меню", callback_data="cmd:menu")],
-    ])
+def kb_market(cmd: str | None = None) -> InlineKeyboardMarkup:
+    """Упрощённая клавиатура: только Обновить + Меню, без лишней навигации."""
+    rows: list[list[InlineKeyboardButton]] = []
+    if cmd:
+        rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"cmd:{cmd}")])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="cmd:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ─────────────────────────── /news ──────────────────────────────

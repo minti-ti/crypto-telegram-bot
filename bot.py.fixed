@@ -120,66 +120,34 @@ async def cmd_help(m: types.Message) -> None:
 
 # ─────────────────────────── callback'и от меню ─────────────────
 @router.callback_query(F.data.startswith("cmd:"))
-async def cb_menu(c: types.CallbackQuery, state: FSMContext) -> None:
+async def cb_menu(c: types.CallbackQuery) -> None:
     cmd = c.data.split(":", 1)[1]
     await c.answer()
-
-    # Для меню-кнопок редактируем текущее сообщение, чтобы не захламлять чат
-    # (кроме news - там длинные сообщения)
-    msg = c.message
-    if cmd not in ("news", "price"):
-        # monkey-patch answer -> edit_text
-        original_answer = msg.answer
-        async def edit_answer(text, reply_markup=None, **kwargs):
-            try:
-                await msg.edit_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN, **kwargs)
-                return msg
-            except Exception:
-                return await original_answer(text, reply_markup=reply_markup, **kwargs)
-        msg.answer = edit_answer  # type: ignore
-
     # Простые команды — вызываем соответствующий хендлер
     if cmd == "fg":
-        await _send_fg(msg)
+        await _send_fg(c.message)
         return
     if cmd == "funding":
-        await _send_funding(msg)
+        await _send_funding(c.message)
         return
     if cmd == "alerts":
-        await cmd_alerts(msg)
+        await cmd_alerts(c.message)
         return
     if cmd == "subs":
-        await cmd_mysubs(msg)
+        await cmd_mysubs(c.message)
         return
     if cmd == "top":
-        await cmd_top(msg)
+        await cmd_top(c.message)
         return
     if cmd == "briefing":
-        await cmd_briefing(msg)
-        return
-    if cmd == "oi":
-        from aiogram.filters import CommandObject
-        await cmd_oi(msg, CommandObject(prefix="/", command="oi", args=None))
-        return
-    if cmd == "calc":
-        await cmd_calc(msg)
-        return
-    if cmd == "settime":
-        from aiogram.filters import CommandObject
-        await cmd_settime(msg, CommandObject(prefix="/", command="settime", args=None))
+        await cmd_briefing(c.message)
         return
     if cmd == "menu":
-        try:
-            await c.message.edit_text(
-                "🏠 *Главное меню*",
-                reply_markup=main_menu_kb(),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception:
-            await c.message.answer(
-                "🏠 *Главное меню*",
-                reply_markup=main_menu_kb(),
-            )
+        await c.answer()
+        await c.message.answer(
+            "🏠 *Главное меню*",
+            reply_markup=main_menu_kb(),
+        )
         return
     if cmd == "news":
         await c.message.answer(
@@ -198,17 +166,10 @@ async def cb_menu(c: types.CallbackQuery, state: FSMContext) -> None:
         return
     if cmd == "morning":
         new_val = await db.toggle_morning(c.from_user.id)
-        try:
-            await c.message.edit_text(
-                f"🌅 Утренняя сводка: {'включена ✅' if new_val else 'выключена ❌'}",
-                reply_markup=kb_market(),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception:
-            await c.message.answer(
-                f"🌅 Утренняя сводка: {'включена ✅' if new_val else 'выключена ❌'}",
-                reply_markup=kb_market(),
-            )
+        await c.message.answer(
+            f"🌅 Утренняя сводка: {'включена ✅' if new_val else 'выключена ❌'}",
+            reply_markup=kb_market(),
+        )
         return
 
 
@@ -480,6 +441,16 @@ async def cmd_oi(m: types.Message, command: CommandObject) -> None:
         await m.answer("\n".join(lines), reply_markup=kb_market())
         return
     await _send_oi(m, command.args.strip())
+
+
+@router.callback_query(F.data == "cmd:oi")
+async def cb_oi(c: types.CallbackQuery) -> None:
+    await c.answer()
+    # Без аргументов — показать топ-3
+    c.message.text = "/oi"
+    # Прокачиваем через fake CommandObject
+    from aiogram.filters import CommandObject
+    await cmd_oi(c.message, CommandObject(prefix="/", command="oi", args=None))
 
 
 # ─────────────────────────── /top ───────────────────────────────
@@ -1219,6 +1190,15 @@ async def cmd_calc(m: types.Message) -> None:
         "📊 *Калькулятор позиции (Risk Management)*\n\n"
         "Задай риск → получи размер позиции автоматически.\n\n"
         "Выбери сторону:",
+        reply_markup=kb_calc(),
+    )
+
+
+@router.callback_query(F.data == "cmd:calc")
+async def cb_calc_menu(c: types.CallbackQuery) -> None:
+    await c.answer()
+    await c.message.answer(
+        "📊 *Калькулятор позиции*\n\nВыбери сторону:",
         reply_markup=kb_calc(),
     )
 

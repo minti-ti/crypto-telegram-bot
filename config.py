@@ -26,6 +26,25 @@ TZ = "Europe/Moscow"
 # ---- Внешние API ----
 BLOCKCHAIR_API_KEY: str = _get("BLOCKCHAIR_API_KEY")
 COINGECKO_API_KEY: str = _get("COINGECKO_API_KEY")
+FINNHUB_API_KEY: str = _get("FINNHUB_API_KEY")
+COINGLASS_API_KEY: str = _get("COINGLASS_API_KEY")
+
+# ---- Экономический календарь ----
+ECON_COUNTRIES: list[str] = [
+    s.strip() for s in _get("ECON_COUNTRIES", "US,United States").split(",") if s.strip()
+]
+ECON_MIN_IMPORTANCE: int = int(_get("ECON_MIN_IMPORTANCE", "3"))  # 1-3, 3 = high only
+ECON_NOTIFY_MINUTES: int = int(_get("ECON_NOTIFY_MINUTES", "60"))  # за сколько минут предупреждать
+
+# ---- Ликвидации ----
+LIQ_SYMBOLS: list[str] = [
+    s.strip().upper()
+    for s in _get("LIQ_SYMBOLS", "BTCUSDT,ETHUSDT").split(",")
+    if s.strip()
+]
+LIQ_THRESHOLD_USD: float = float(_get("LIQ_THRESHOLD_USD", "5000000"))  # $5M / hour
+LIQ_LOOKBACK_MINUTES: int = int(_get("LIQ_LOOKBACK_MINUTES", "60"))
+LIQ_COOLDOWN_MINUTES: int = int(_get("LIQ_COOLDOWN_MINUTES", "60"))
 
 # ---- Новости: RSS + OpenRouter (опциональная LLM-фильтрация) ----
 # Если OPENROUTER_API_KEY не задан, бот рассылает все новости из RSS as-is.
