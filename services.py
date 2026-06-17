@@ -571,21 +571,102 @@ async def fetch_economic_calendar(
     to_date: str,
 ) -> list[dict]:
     """Finnhub economic calendar. from/to в формате YYYY-MM-DD."""
-    if not config.FINNHUB_API_KEY:
-        log.warning("FINNHUB_API_KEY not set, skipping calendar")
+    if config.FINNHUB_API_KEY:
+        try:
+            data = await _get_json(
+                session,
+                "https://finnhub.io/api/v1/calendar/economic",
+                {
+                    "from": from_date,
+                    "to": to_date,
+                    "token": config.FINNHUB_API_KEY,
+                },
+            )
+            if data and "economicCalendar" in data:
+                return list(data["economicCalendar"])
+        except Exception as e:
+            log.warning("Finnhub calendar failed: %s", e)
+
+    # Fallback: MQL5 economic calendar (не требует ключа)
+    return await fetch_mql5_calendar(session, from_date, to_date)
+
+
+async def fetch_mql5_calendar(
+    session: aiohttp.ClientSession,
+    from_date: str,
+    to_date: str,
+) -> list[dict]:
+    """Парсим MQL5 economic calendar. Возвращает события в формате Finnhub."""
+    url = "https://www.mql5.com/en/economic-calendar"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    try:
+        async with session.get(url, headers=headers, timeout=TIMEOUT) as r:
+            if r.status >= 400:
+                log.warning("MQL5 calendar HTTP %s", r.status)
+                return []
+            text = await r.text()
+    except Exception as e:
+        log.warning("MQL5 calendar error: %s", e)
         return []
-    data = await _get_json(
-        session,
-        "https://finnhub.io/api/v1/calendar/economic",
-        {
-            "from": from_date,
-            "to": to_date,
-            "token": config.FINNHUB_API_KEY,
-        },
-    )
-    if not data or "economicCalendar" not in data:
-        return []
-    return list(data["economicCalendar"])
+
+    # Ищем строки вида: 2026.06.15 12:30, USD, Event Name, Actual: x, Forecast: y, Previous: z
+    lines = text.splitlines()
+    events: list[dict] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(
+            r"(\d{4}\.\d{2}\.\d{2})\s+(\d{2}:\d{2}),\s+([A-Z]{3}),\s+(.*)",
+            line,
+        )
+        if not m:
+            continue
+        date_str, time_str, currency, rest = m.groups()
+        # Парсим Actual/Forecast/Previous из rest
+        event_name = rest
+        actual = estimate = previous = ""
+        for label in ("Actual:", "Forecast:", "Previous:"):
+            if label in rest:
+                idx = rest.index(label)
+                part = rest[idx:]
+                # значение до следующей запятой или конца
+                val_end = part.find(",", len(label))
+                if val_end == -1:
+                    val_end = len(part)
+                val = part[len(label):val_end].strip()
+                event_name = rest[:idx].rstrip(", ")
+                if label == "Actual:":
+                    actual = val
+                elif label == "Forecast:":
+                    estimate = val
+                elif label == "Previous:":
+                    previous = val
+
+        # Переводим дату в YYYY-MM-DD
+        try:
+            dt = datetime.strptime(date_str, "%Y.%m.%d")
+            iso_date = dt.strftime("%Y-%m-%d")
+        except ValueError:
+            iso_date = date_str
+
+        events.append({
+            "date": iso_date,
+            "time": time_str,
+            "country": currency,
+            "event": event_name.strip(),
+            "actual": actual or None,
+            "estimate": estimate or None,
+            "previous": previous or None,
+            "impact": "",  # MQL5 не даёт impact
+        })
+
+    # Фильтруем по датам
+    out = [e for e in events if from_date <= e["date"] <= to_date]
+    return out
 
 
 def _filter_us_macro_events(events: list[dict]) -> list[dict]:
@@ -593,28 +674,31 @@ def _filter_us_macro_events(events: list[dict]) -> list[dict]:
     out: list[dict] = []
     for e in events:
         country = (e.get("country") or "").upper()
-        if country not in ("US", "UNITED STATES", "USA"):
+        if country not in ("US", "USD", "UNITED STATES", "USA"):
             continue
         event_name = (e.get("event") or "").upper()
 
         # impact у Finnhub — строка "1" / "2" / "3" (1=low, 2=medium, 3=high)
+        # у MQL5 impact нет, считаем его неизвестным
         impact_raw = e.get("impact")
         impact_val = 0
         if isinstance(impact_raw, (int, float)):
             impact_val = int(impact_raw)
-        elif isinstance(impact_raw, str):
+        elif isinstance(impact_raw, str) and impact_raw.strip():
             impact_raw = impact_raw.strip().lower()
             if impact_raw.isdigit():
                 impact_val = int(impact_raw)
             else:
                 impact_val = {"low": 1, "medium": 2, "high": 3}.get(impact_raw, 0)
 
-        # ECON_MIN_IMPORTANCE по умолчанию 3 (high). Если хочешь medium — ставь 2 в .env
-        if impact_val < config.ECON_MIN_IMPORTANCE:
-            # но всё равно пропускаем, если это не явно важное ключевое слово
-            if not any(kw in event_name for kw in ("CPI", "NFP", "FOMC", "GDP", "PPI")):
-                continue
-        out.append(e)
+        # Важные ключевые слова — всегда пропускаем
+        if any(kw in event_name for kw in US_ECON_KEYWORDS):
+            out.append(e)
+            continue
+
+        # Если impact известен и достаточно высокий — тоже пропускаем
+        if impact_val >= config.ECON_MIN_IMPORTANCE:
+            out.append(e)
     return out
 
 
