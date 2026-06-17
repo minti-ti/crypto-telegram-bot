@@ -103,7 +103,7 @@ HELP_TEXT = (
 
 @router.message(Command("start"))
 async def cmd_start(m: types.Message) -> None:
-    db.upsert_user(m.from_user.id)
+    await db.upsert_user(m.from_user.id)
     await m.answer(
         f"Привет, *{m.from_user.first_name or 'друг'}*! 👋\n\n"
         "Я — твой персональный крипто-ассистент.\n"
@@ -165,7 +165,7 @@ async def cb_menu(c: types.CallbackQuery) -> None:
         )
         return
     if cmd == "morning":
-        new_val = db.toggle_morning(c.from_user.id)
+        new_val = await db.toggle_morning(c.from_user.id)
         await c.message.answer(
             f"🌅 Утренняя сводка: {'включена ✅' if new_val else 'выключена ❌'}",
             reply_markup=kb_market(),
@@ -618,7 +618,7 @@ async def cmd_alert(m: types.Message, command: CommandObject) -> None:
         return
     if not sym.endswith("USDT"):
         sym = sym + "USDT"
-    alert_id = db.add_alert(m.from_user.id, sym, direction.lower(), price)
+    alert_id = await db.add_alert(m.from_user.id, sym, direction.lower(), price)
     await m.answer(
         f"✅ Алерт создан (id *{alert_id}*):\n"
         f"`{services.symbol_to_coin(sym)}` {direction.lower()} {price:g}\n"
@@ -677,7 +677,7 @@ async def alert_price(m: types.Message, state: FSMContext) -> None:
         await m.answer("❌ Это не число. Попробуй ещё раз:")
         return
     data = await state.get_data()
-    alert_id = db.add_alert(
+    alert_id = await db.add_alert(
         m.from_user.id, data["symbol"], data["direction"], price
     )
     await state.clear()
@@ -712,7 +712,7 @@ async def cmd_delalert(m: types.Message, command: CommandObject) -> None:
     if not command.args or not command.args.isdigit():
         await m.answer("Формат: `/delalert 5`")
         return
-    if db.delete_alert(m.from_user.id, int(command.args)):
+    if await db.delete_alert(m.from_user.id, int(command.args)):
         await m.answer(f"🗑 Алерт #{command.args} удалён.", reply_markup=kb_alerts())
     else:
         await m.answer("❌ Алерт не найден или не принадлежит тебе.", reply_markup=kb_alerts())
@@ -728,7 +728,7 @@ async def cmd_subscribe(m: types.Message, command: CommandObject) -> None:
     if not coins:
         await m.answer("Не указаны монеты.")
         return
-    added = db.add_subs(m.from_user.id, coins)
+    added = await db.add_subs(m.from_user.id, coins)
     await m.answer(
         f"✅ Подписки обновлены. Добавлено новых: *{added}*.\n"
         f"Бот будет присылать важные новости по этим монетам.",
@@ -742,7 +742,7 @@ async def cmd_unsubscribe(m: types.Message, command: CommandObject) -> None:
         await m.answer("Формат: `/unsubscribe BTC` (или `BTC,ETH`)")
         return
     coins = [c.strip().upper() for c in re.split(r"[,\s]+", command.args) if c.strip()]
-    removed = db.remove_subs(m.from_user.id, coins)
+    removed = await db.remove_subs(m.from_user.id, coins)
     await m.answer(f"🗑 Удалено подписок: *{removed}*.", reply_markup=kb_news())
 
 
@@ -792,7 +792,7 @@ async def morning_job() -> None:
     log.info("Morning briefing job started")
     try:
         text = await services.build_morning_briefing()
-        users = db.all_morning_users()
+        users = await db.all_morning_users()
         for uid in users:
             try:
                 await bot.send_message(uid, text, disable_web_page_preview=True)
@@ -956,7 +956,7 @@ async def setup_scheduler() -> AsyncIOScheduler:
 @router.message(Command("settime"))
 async def cmd_settime(m: types.Message, command: CommandObject) -> None:
     """Показать текущее время или изменить: /settime HH:MM"""
-    current = db.get_setting("morning_time") or config.MORNING_TIME
+    current = await db.get_setting("morning_time") or config.MORNING_TIME
     if not command.args:
         await m.answer(
             f"⏰ *Текущее время утренней сводки:* `{current}` MSK\n\n"
@@ -979,7 +979,7 @@ async def cmd_settime(m: types.Message, command: CommandObject) -> None:
         )
         return
     new_time = f"{hh:02d}:{mm:02d}"
-    db.set_setting("morning_time", new_time)
+    await db.set_setting("morning_time", new_time)
     # Reschedule без рестарта (remove + add — надёжнее reschedule_job)
     if _scheduler:
         try:
@@ -1009,7 +1009,7 @@ async def cb_settime(c: types.CallbackQuery) -> None:
     except ValueError:
         await c.answer("Неверный формат")
         return
-    db.set_setting("morning_time", f"{hh:02d}:{mm:02d}")
+    await db.set_setting("morning_time", f"{hh:02d}:{mm:02d}")
     if _scheduler:
         try:
             _scheduler.remove_job("morning")
@@ -1049,7 +1049,7 @@ async def cb_news_for_coin(c: types.CallbackQuery) -> None:
 async def cb_sub_for_coin(c: types.CallbackQuery) -> None:
     """Подписаться на монету из кнопки kb_news."""
     coin = c.data.split(":", 1)[1].upper()
-    added = db.add_subs(c.from_user.id, [coin])
+    added = await db.add_subs(c.from_user.id, [coin])
     await c.answer(f"✅ Подписка на {coin}: добавлено {added}")
     await c.message.answer(
         f"✅ Подписка на *{coin}* активна.\n"
