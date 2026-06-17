@@ -623,7 +623,7 @@ async def cmd_alert(m: types.Message, command: CommandObject) -> None:
         f"✅ Алерт создан (id *{alert_id}*):\n"
         f"`{services.symbol_to_coin(sym)}` {direction.lower()} {price:g}\n"
         f"Бот пришлёт сообщение, когда условие сработает.",
-        reply_markup=kb_alerts_list([]),
+        reply_markup=kb_alerts(),
     )
 
 
@@ -685,7 +685,7 @@ async def alert_price(m: types.Message, state: FSMContext) -> None:
         f"✅ Алерт создан (id *{alert_id}*):\n"
         f"`{services.symbol_to_coin(data['symbol'])}` "
         f"{data['direction']} {price:g}",
-        reply_markup=kb_alerts_list([]),
+        reply_markup=kb_alerts(),
     )
 
 
@@ -694,7 +694,7 @@ async def cmd_alerts(m: types.Message) -> None:
     rows = await db.list_user_alerts(m.from_user.id)
     if not rows:
         await m.answer("У тебя нет алертов. Создай: `/alert BTCUSDT above 70000`",
-                       reply_markup=kb_alerts_list([]))
+                       reply_markup=kb_alerts())
         return
     lines = ["🚨 *Твои алерты:*"]
     for r in rows:
@@ -704,7 +704,7 @@ async def cmd_alerts(m: types.Message) -> None:
             f"• *#{r['id']}* `{coin}` {r['direction']} {r['price']:g} — {status}"
         )
     lines.append("\nУдалить: `/delalert <id>`")
-    await m.answer("\n".join(lines), reply_markup=kb_alerts_list([]))
+    await m.answer("\n".join(lines), reply_markup=kb_alerts())
 
 
 @router.message(Command("delalert"))
@@ -713,9 +713,9 @@ async def cmd_delalert(m: types.Message, command: CommandObject) -> None:
         await m.answer("Формат: `/delalert 5`")
         return
     if await db.delete_alert(m.from_user.id, int(command.args)):
-        await m.answer(f"🗑 Алерт #{command.args} удалён.", reply_markup=kb_alerts_list([]))
+        await m.answer(f"🗑 Алерт #{command.args} удалён.", reply_markup=kb_alerts())
     else:
-        await m.answer("❌ Алерт не найден или не принадлежит тебе.", reply_markup=kb_alerts_list([]))
+        await m.answer("❌ Алерт не найден или не принадлежит тебе.", reply_markup=kb_alerts())
 
 
 # ─────────────────────────── подписки на новости ─────────────────
@@ -729,11 +729,10 @@ async def cmd_subscribe(m: types.Message, command: CommandObject) -> None:
         await m.answer("Не указаны монеты.")
         return
     added = await db.add_subs(m.from_user.id, coins)
-    subs = await db.get_user_subs(m.from_user.id)
     await m.answer(
         f"✅ Подписки обновлены. Добавлено новых: *{added}*.\n"
         f"Бот будет присылать важные новости по этим монетам.",
-        reply_markup=kb_subs_current(subs),
+        reply_markup=kb_news(coins),
     )
 
 
@@ -744,8 +743,7 @@ async def cmd_unsubscribe(m: types.Message, command: CommandObject) -> None:
         return
     coins = [c.strip().upper() for c in re.split(r"[,\s]+", command.args) if c.strip()]
     removed = await db.remove_subs(m.from_user.id, coins)
-    subs = await db.get_user_subs(m.from_user.id)
-    await m.answer(f"🗑 Удалено подписок: *{removed}*.", reply_markup=kb_subs_current(subs))
+    await m.answer(f"🗑 Удалено подписок: *{removed}*.", reply_markup=kb_news())
 
 
 @router.message(Command("mysubs"))
@@ -753,11 +751,11 @@ async def cmd_mysubs(m: types.Message) -> None:
     subs = await db.get_user_subs(m.from_user.id)
     if not subs:
         await m.answer("Нет подписок. Добавь: `/subscribe BTC,ETH`",
-                       reply_markup=kb_subs_current([]))
+                       reply_markup=kb_news())
         return
     await m.answer(
         "🔔 *Твои подписки:*\n" + ", ".join(f"`{s}`" for s in subs),
-        reply_markup=kb_subs_current(subs),
+        reply_markup=kb_news(),
     )
 
 
@@ -1027,6 +1025,36 @@ async def cb_settime(c: types.CallbackQuery) -> None:
     await c.message.edit_text(
         f"✅ Утренняя сводка теперь в *{hh:02d}:{mm:02d}* MSK.\n"
         f"_Изменения применены сразу._"
+    )
+
+
+@router.callback_query(F.data.startswith("news:"))
+async def cb_news_for_coin(c: types.CallbackQuery) -> None:
+    """Новости по конкретной монете (из кнопки kb_price)."""
+    coin = c.data.split(":", 1)[1].upper()
+    await c.answer()
+    await c.message.answer(f"⏳ Ищу новости по {coin}...")
+    # Имитируем /news
+    raw = await services.fetch_rss_feeds(lookback_hours=24)
+    if not raw:
+        await c.message.answer("⚠️ Не удалось получить RSS.", reply_markup=kb_market())
+        return
+    items = await services.filter_news_with_llm(raw, target_coins=[coin])
+    text = _format_news_message(items, [coin])
+    await c.message.answer(text, disable_web_page_preview=True,
+                           reply_markup=kb_news([coin]))
+
+
+@router.callback_query(F.data.startswith("sub:"))
+async def cb_sub_for_coin(c: types.CallbackQuery) -> None:
+    """Подписаться на монету из кнопки kb_news."""
+    coin = c.data.split(":", 1)[1].upper()
+    added = await db.add_subs(c.from_user.id, [coin])
+    await c.answer(f"✅ Подписка на {coin}: добавлено {added}")
+    await c.message.answer(
+        f"✅ Подписка на *{coin}* активна.\n"
+        f"Бот будет присылать важные новости.",
+        reply_markup=kb_news(),
     )
 
 
