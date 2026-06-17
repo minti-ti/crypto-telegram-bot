@@ -61,7 +61,7 @@ NEWS_RSS_FEEDS: list[str] = [
         "https://decrypt.co/feed",
     ).split(",") if u.strip()
 ]
-NEWS_LOOKBACK_HOURS: int = int(_get("NEWS_LOOKBACK_HOURS", "24"))
+NEWS_LOOKBACK_HOURS: int = int(_get("NEWS_LOOKBACK_HOURS", "12"))
 NEWS_MAX_PER_LLM: int = int(_get("NEWS_MAX_PER_LLM", "30"))
 
 # ---- Параметры ----

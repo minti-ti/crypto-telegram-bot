@@ -25,7 +25,7 @@ import db
 import services
 from keyboards import (
     main_menu_kb,
-    kb_price, kb_market, kb_news_my_subs, kb_news_after,
+    kb_price, kb_price_symbols, kb_market, kb_news_my_subs, kb_news_after,
     kb_alerts_list, kb_alert_confirm,
     kb_subs_current, kb_settime, kb_calc, kb_calendar, kb_liq,
     cancel_kb,
@@ -106,6 +106,10 @@ class CalcState(StatesGroup):
     fee_percent = State()
 
 
+class PriceCustomState(StatesGroup):
+    waiting_coin = State()
+
+
 # ─────────────────────────── /start и меню ─────────────────────
 HELP_TEXT = (
     "🤖 *Crypto-бот*\n\n"
@@ -139,10 +143,11 @@ HELP_TEXT = (
 @router.message(Command("start"))
 async def cmd_start(m: types.Message) -> None:
     await db.upsert_user(m.from_user.id)
+    current_time = await db.get_setting("morning_time") or config.MORNING_TIME
     await m.answer(
         f"Привет, *{m.from_user.first_name or 'друг'}*! 👋\n\n"
         "Я — твой персональный крипто-ассистент.\n"
-        "Каждое утро в *" + config.MORNING_TIME + "* (Europe/Moscow) присылаю сводку рынка.\n"
+        f"Каждое утро в *{current_time}* (Europe/Moscow) присылаю сводку рынка.\n"
         "Нажми кнопку или набери /help.",
         reply_markup=main_menu_kb(),
     )
@@ -184,12 +189,13 @@ async def cb_menu(c: types.CallbackQuery, state: FSMContext) -> None:
         await _send_oi_top(c)
         return
     if cmd == "calc":
+        await state.set_state(RiskCalc.deposit)
         await _send_or_edit(
             c,
-            "📊 *Калькулятор позиции (Risk Management)*\n\n"
-            "Задай риск → получи размер позиции автоматически.\n\n"
-            "Выбери сторону:",
-            reply_markup=kb_calc(),
+            "📊 *Калькулятор позиции*\n\n"
+            "Риск фиксирован — *1%* от депозита.\n"
+            "Введи *размер депозита в USD*:",
+            reply_markup=cancel_kb(),
         )
         return
     if cmd == "settime":
@@ -214,10 +220,8 @@ async def cb_menu(c: types.CallbackQuery, state: FSMContext) -> None:
     if cmd == "price":
         await _send_or_edit(
             c,
-            "Укажи тикер. Примеры:\n"
-            "• `/price BTC`\n"
-            "• `/price BTCUSDT`",
-            reply_markup=kb_market(),
+            "💰 *Цена* — выбери монету или введи тикер вручную:",
+            reply_markup=kb_price_symbols(),
         )
         return
     if cmd == "morning":
@@ -244,28 +248,18 @@ async def cb_cancel(c: types.CallbackQuery, state: FSMContext) -> None:
 
 
 # ─────────────────────────── /price ─────────────────────────────
-@router.message(Command("price"))
-async def cmd_price(m: types.Message, command: CommandObject) -> None:
-    if not command.args:
-        await m.answer(
-            "Укажи тикер. Примеры:\n"
-            "• `/price BTC`\n"
-            "• `/price BTCUSDT`\n"
-            "• `/price eth`"
-        )
-        return
-    sym = command.args.strip().upper().replace("/", "")
+async def _send_price(target: types.Message | types.CallbackQuery, symbol: str) -> None:
+    sym = symbol.upper().replace("/", "")
     if not sym.endswith("USDT") and sym not in ("BTCUSDT", "ETHUSDT"):
-        # попробуем добавить USDT
         sym = sym + "USDT"
     async with services._shared_session() as s:
         ticker = await services._get_json(
             s,
-            "https://api.binance.com/api/v3/ticker/24hr",
+            "https://fapi.binance.com/fapi/v1/ticker/24hr",
             {"symbol": sym},
         )
     if not ticker:
-        await m.answer(f"❌ Не нашёл `{sym}` на Binance. Проверь тикер.")
+        await _send_or_edit(target, f"❌ Не нашёл `{sym}` на Binance. Проверь тикер.")
         return
     try:
         price = float(ticker["lastPrice"])
@@ -274,10 +268,11 @@ async def cmd_price(m: types.Message, command: CommandObject) -> None:
         lo = float(ticker["lowPrice"])
         vol = float(ticker.get("quoteVolume", 0))
     except (KeyError, TypeError, ValueError):
-        await m.answer("⚠️ Не удалось распарсить ответ биржи.")
+        await _send_or_edit(target, "⚠️ Не удалось распарсить ответ биржи.")
         return
     coin = services.symbol_to_coin(sym)
-    await m.answer(
+    await _send_or_edit(
+        target,
         f"💰 *{coin}*\n"
         f"Цена: *{services.fmt_usd(price, 2)}*\n"
         f"24ч: {services.fmt_pct(ch)}\n"
@@ -285,6 +280,39 @@ async def cmd_price(m: types.Message, command: CommandObject) -> None:
         f"Объём: {services.fmt_volume(vol)}",
         reply_markup=kb_price(sym),
     )
+
+
+@router.message(Command("price"))
+async def cmd_price(m: types.Message, command: CommandObject, state: FSMContext) -> None:
+    if not command.args:
+        await _send_or_edit(
+            m,
+            "💰 *Цена* — выбери монету или введи тикер вручную:",
+            reply_markup=kb_price_symbols(),
+        )
+        return
+    await _send_price(m, command.args.strip())
+
+
+@router.callback_query(F.data.startswith("price:"))
+async def cb_price_coin(c: types.CallbackQuery, state: FSMContext) -> None:
+    await c.answer()
+    coin = c.data.split(":", 1)[1].upper()
+    if coin == "CUSTOM":
+        await state.set_state(PriceCustomState.waiting_coin)
+        await _send_or_edit(
+            c,
+            "✏️ Введи тикер монеты (например `BTC`, `ETH`, `SOL`):",
+            reply_markup=cancel_kb(),
+        )
+        return
+    await _send_price(c, coin)
+
+
+@router.message(PriceCustomState.waiting_coin)
+async def price_custom_coin(m: types.Message, state: FSMContext) -> None:
+    await state.clear()
+    await _send_price(m, m.text.strip())
 
 
 # ─────────────────────────── /fg ────────────────────────────────
@@ -397,7 +425,7 @@ async def cmd_news(m: types.Message, command: CommandObject) -> None:
 async def _show_news(target: types.Message | types.CallbackQuery, currencies: list[str]) -> None:
     """Собрать новости и отправить/отредактировать."""
     await _send_or_edit(target, "⏳ Собираю новости...")
-    raw = await services.fetch_rss_feeds(lookback_hours=24)
+    raw = await services.fetch_rss_feeds(lookback_hours=config.NEWS_LOOKBACK_HOURS)
     if not raw:
         await _send_or_edit(
             target,
@@ -508,7 +536,7 @@ async def cmd_oi(m: types.Message, command: CommandObject) -> None:
 async def _send_top(target: types.Message | types.CallbackQuery) -> None:
     async with services._shared_session() as s:
         data = await services._get_json(
-            s, "https://api.binance.com/api/v3/ticker/24hr"
+            s, "https://fapi.binance.com/fapi/v1/ticker/24hr"
         )
     if not data:
         await _send_or_edit(target, "⚠️ Не удалось получить данные.", reply_markup=kb_market())
@@ -882,7 +910,7 @@ async def cmd_calendar(m: types.Message) -> None:
 # ─────────────────────────── /liq ─────────────────────────────────
 async def _send_liq(target: types.Message | types.CallbackQuery) -> None:
     await _send_or_edit(target, "⏳ Считаю ликвидации...")
-    text = await services.build_liquidations_text(window_minutes=60)
+    text = await services.build_liquidations_text(hours=24)
     await _send_or_edit(target, text, reply_markup=kb_liq())
 
 
@@ -954,7 +982,7 @@ async def check_news_job() -> None:
     target_coins = list(subs_by_coin.keys())
 
     # 1. Скачиваем RSS
-    raw = await services.fetch_rss_feeds(lookback_hours=24)
+    raw = await services.fetch_rss_feeds(lookback_hours=config.NEWS_LOOKBACK_HOURS)
     if not raw:
         log.info("News job: no RSS items fetched")
         return
@@ -1369,42 +1397,21 @@ async def cb_alert_noop(c: types.CallbackQuery) -> None:
     await c.answer()
 
 
-# ─────────────────────────── Калькулятор сделки ──────────────────
-# FSM для risk-management калькулятора
+# ─────────────────────────── Калькулятор позиции ────────────────
 class RiskCalc(StatesGroup):
-    side = State()           # long/short
-    deposit = State()        # депозит в USD
-    risk_pct = State()       # риск на сделку в %
-    entry = State()          # цена входа
-    stop = State()           # стоп-лосс
-    take = State()           # тейк-профит
-    leverage = State()       # плечо (опционально)
-    fee_pct = State()        # комиссия биржи (опционально)
+    deposit = State()  # депозит в USD
+    entry = State()    # цена входа
+    stop = State()     # стоп-лосс
 
 
 @router.message(Command("calc"))
-async def cmd_calc(m: types.Message) -> None:
+async def cmd_calc(m: types.Message, state: FSMContext) -> None:
+    await state.set_state(RiskCalc.deposit)
     await _send_or_edit(
         m,
-        "📊 *Калькулятор позиции (Risk Management)*\n\n"
-        "Задай риск → получи размер позиции автоматически.\n\n"
-        "Выбери сторону:",
-        reply_markup=kb_calc(),
-    )
-
-
-@router.callback_query(F.data.startswith("calc:"))
-async def cb_calc_side(c: types.CallbackQuery, state: FSMContext) -> None:
-    side = c.data.split(":")[1]
-    await state.set_state(RiskCalc.deposit)
-    await state.update_data(side=side)
-    await c.answer()
-    arrow = "🟢 Лонг" if side == "long" else "🔴 Шорт"
-    await _send_or_edit(
-        c,
-        f"📊 Калькулятор: *{arrow}*\n\n"
-        "Введи *размер депозита в USD*:\n"
-        "_(сколько у тебя всего на бирже)_",
+        "📊 *Калькулятор позиции*\n\n"
+        "Риск фиксирован — *1%* от депозита.\n"
+        "Введи *размер депозита в USD*:",
         reply_markup=cancel_kb(),
     )
 
@@ -1419,20 +1426,6 @@ async def risk_deposit(m: types.Message, state: FSMContext) -> None:
         await m.answer("❌ Введи положительное число, например `1000`:")
         return
     await state.update_data(deposit=v)
-    await state.set_state(RiskCalc.risk_pct)
-    await m.answer("Сколько *% риска на сделку*?\n_(обычно 0.5–2%)_")
-
-
-@router.message(RiskCalc.risk_pct)
-async def risk_pct(m: types.Message, state: FSMContext) -> None:
-    try:
-        v = float(m.text.replace(",", ".").replace(" ", ""))
-        if v <= 0 or v > 100:
-            raise ValueError
-    except ValueError:
-        await m.answer("❌ Введи % от 0 до 100, обычно `1`:")
-        return
-    await state.update_data(risk_pct=v)
     await state.set_state(RiskCalc.entry)
     await m.answer("Введи *цену входа*:\n_(например `64270`)_")
 
@@ -1454,175 +1447,44 @@ async def risk_entry(m: types.Message, state: FSMContext) -> None:
 @router.message(RiskCalc.stop)
 async def risk_stop(m: types.Message, state: FSMContext) -> None:
     try:
-        v = float(m.text.replace(",", ".").replace(" ", ""))
-        if v <= 0:
+        stop = float(m.text.replace(",", ".").replace(" ", ""))
+        if stop <= 0:
             raise ValueError
     except ValueError:
         await m.answer("❌ Введи положительное число:")
         return
     data = await state.get_data()
-    # Для шорта стоп должен быть ВЫШЕ входа
-    if data["side"] == "long" and v >= data["entry"]:
-        await m.answer("❌ Для лонга стоп должен быть НИЖЕ входа. Попробуй ещё:")
+    entry = data["entry"]
+    if abs(stop - entry) < 1e-9:
+        await m.answer("❌ Стоп не может равняться входу. Попробуй ещё:")
         return
-    if data["side"] == "short" and v <= data["entry"]:
-        await m.answer("❌ Для шорта стоп должен быть ВЫШЕ входа. Попробуй ещё:")
-        return
-    await state.update_data(stop=v)
-    await state.set_state(RiskCalc.take)
-    await m.answer("Введи *тейк-профит* (TP):\n_(где фиксируешь прибыль)_")
-
-
-@router.message(RiskCalc.take)
-async def risk_take(m: types.Message, state: FSMContext) -> None:
-    try:
-        v = float(m.text.replace(",", ".").replace(" ", ""))
-        if v <= 0:
-            raise ValueError
-    except ValueError:
-        await m.answer("❌ Введи положительное число:")
-        return
-    data = await state.get_data()
-    # Проверяем что TP в правильную сторону
-    if data["side"] == "long" and v <= data["entry"]:
-        await m.answer("❌ Для лонга TP должен быть ВЫШЕ входа. Попробуй ещё:")
-        return
-    if data["side"] == "short" and v >= data["entry"]:
-        await m.answer("❌ Для шорта TP должен быть НИЖЕ входа. Попробуй ещё:")
-        return
-    await state.update_data(take=v)
-    await state.set_state(RiskCalc.leverage)
-    await m.answer(
-        "Введи *плечо* (или `1` для спота, `10` для 10x и т.п.):"
-    )
-
-
-@router.message(RiskCalc.leverage)
-async def risk_leverage(m: types.Message, state: FSMContext) -> None:
-    try:
-        v = float(m.text.replace(",", ".").replace(" ", ""))
-        if v <= 0:
-            raise ValueError
-    except ValueError:
-        await m.answer("❌ Введи положительное число:")
-        return
-    await state.update_data(leverage=v)
-    await state.set_state(RiskCalc.fee_pct)
-    await m.answer(
-        "Введи *комиссию биржи в %* (например `0.1` для Binance, "
-        "`0.04` для Bybit, `0` если без):"
-    )
-
-
-@router.message(RiskCalc.fee_pct)
-async def risk_fee(m: types.Message, state: FSMContext) -> None:
-    try:
-        fee = float(m.text.replace(",", ".").replace(" ", ""))
-        if fee < 0:
-            raise ValueError
-    except ValueError:
-        await m.answer("❌ Введи число (можно 0):")
-        return
-
-    data = await state.get_data()
     await state.clear()
 
     deposit = data["deposit"]
-    risk_pct = data["risk_pct"]
-    entry = data["entry"]
-    stop = data["stop"]
-    take = data["take"]
-    leverage = data["leverage"]
-    side = data["side"]
-
-    # === Расчёты (по таблице пользователя) ===
+    risk_pct = 1.0  # фиксированный риск
     risk_usd = deposit * (risk_pct / 100)
 
-    # Размер стопа в %
-    if side == "long":
-        stop_pct = (entry - stop) / entry * 100
-        take_pct = (take - entry) / entry * 100
-    else:  # short
-        stop_pct = (stop - entry) / entry * 100
-        take_pct = (entry - take) / entry * 100
+    stop_pct = abs(entry - stop) / entry * 100
+    position_value = risk_usd / (stop_pct / 100) if stop_pct > 0 else 0
+    qty = position_value / entry if entry > 0 else 0
 
-    # Объём позиции (не маржа!) — это полный размер позиции = риск / стоп%
-    if stop_pct > 0:
-        position_value = risk_usd / (stop_pct / 100)
-    else:
-        position_value = 0
-
-    # Размер в монетах для биржи
-    qty = position_value / entry
-
-    # Маржа = объём позиции / плечо
-    margin = position_value / leverage
-
-    # Потенциальная прибыль (gross)
-    if side == "long":
-        gross_profit = (take - entry) * qty
-    else:
-        gross_profit = (entry - take) * qty
-
-    gross_profit_pct = (gross_profit / position_value) * 100 if position_value else 0
-
-    # Комиссии (открытие + закрытие)
+    # Bybit futures taker ~0.06% (открытие + закрытие)
+    fee = 0.06
     fee_amount = position_value * (fee / 100) * 2
 
-    net_profit = gross_profit - fee_amount
-    net_profit_pct = (net_profit / margin) * 100 if margin else 0
-
-    # R:R (Reward / Risk)
-    rr_ratio = (gross_profit / risk_usd) if risk_usd > 0 else 0
-
-    # Цена ликвидации (грубо)
-    if leverage > 1:
-        if side == "long":
-            liq_price = entry * (1 - 1/leverage + 0.005)
-        else:
-            liq_price = entry * (1 + 1/leverage - 0.005)
-    else:
-        liq_price = None
-
-    # === Форматирование результата ===
-    side_label = "🟢 Лонг" if side == "long" else "🔴 Шорт"
-    arrow_p = "💰" if net_profit >= 0 else "💸"
-
-    rr_text = f"{rr_ratio:.2f}"
-    if rr_ratio >= 2:
-        rr_emoji = "🟢"
-    elif rr_ratio >= 1.5:
-        rr_emoji = "🟡"
-    else:
-        rr_emoji = "🔴"
-
-    liq_text = f"`{liq_price:,.2f}`" if liq_price else "_нет (спот)_"
-
     msg = (
-        f"📊 *Калькулятор позиции* — {side_label}\n\n"
+        f"📊 *Калькулятор позиции*\n\n"
         f"📥 *Вводные:*\n"
         f"Депозит: `{deposit:,.2f} USD`\n"
-        f"Риск на сделку: `{risk_pct}%` = `{risk_usd:,.2f} USD`\n"
-        f"Плечо: `x{leverage:g}`\n"
-        f"Комиссия: `{fee}%` × 2 стороны\n\n"
-        f"🎯 *Сделка:*\n"
+        f"Риск: `{risk_pct}%` = `{risk_usd:,.2f} USD`\n"
         f"Вход: `{entry:,.2f}`\n"
-        f"Стоп-лосс: `{stop:,.2f}` ({stop_pct:.2f}% от входа)\n"
-        f"Тейк-профит: `{take:,.2f}` ({take_pct:.2f}% от входа)\n"
-        f"R:R (Reward/Risk): {rr_emoji} `{rr_text}`\n\n"
-        f"💼 *Расчёт позиции:*\n"
-        f"Маржа: `{margin:,.2f} USD`\n"
+        f"Стоп: `{stop:,.2f}` ({stop_pct:.2f}% от входа)\n\n"
+        f"💼 *Расчёт:*\n"
         f"Объём позиции: `{position_value:,.2f} USD`\n"
         f"Размер в монетах: `{qty:.6f}`\n"
-        f"⚠️ Ликвидация: {liq_text}\n\n"
-        f"📈 *Результат:*\n"
-        f"Gross прибыль: `{gross_profit:+,.2f} USD` ({gross_profit_pct:+.2f}%)\n"
-        f"Комиссии: `{fee_amount:,.2f} USD`\n"
-        f"{arrow_p} *Net прибыль: `{net_profit:+,.2f} USD`*\n"
-        f"ROI от маржи: `{net_profit_pct:+.2f}%`\n\n"
-        f"_Расчёт приблизительный. Реальная комиссия и ликвидация зависят от биржи._"
+        f"Комиссия Bybit (~{fee}% × 2): `{fee_amount:,.2f} USD`\n\n"
+        f"_Расчёт приблизительный. Фиксирован 1% риска от депозита._"
     )
-
     await m.answer(msg, reply_markup=kb_market())
 
 

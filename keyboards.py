@@ -36,7 +36,27 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     ])
 
 
-# ─────────────────────────── /price ──────────────────────────────
+
+
+
+# ─────────────────────────── /price ───────────────────────────────
+PRICE_SYMBOLS = ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "TON"]
+
+
+def kb_price_symbols() -> InlineKeyboardMarkup:
+    """Выбор монеты для цены."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for i in range(0, len(PRICE_SYMBOLS), 4):
+        chunk = PRICE_SYMBOLS[i:i+4]
+        rows.append([
+            InlineKeyboardButton(text=c, callback_data=f"price:{c}")
+            for c in chunk
+        ])
+    rows.append([InlineKeyboardButton(text="✏️ Ввести вручную", callback_data="price:custom")])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="cmd:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def kb_price(symbol: str) -> InlineKeyboardMarkup:
     coin = _symbol_to_coin(symbol)
     return InlineKeyboardMarkup(inline_keyboard=[

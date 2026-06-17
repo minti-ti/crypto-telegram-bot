@@ -88,7 +88,7 @@ async def get_24h_tickers(
     session: aiohttp.ClientSession, symbols: list[str]
 ) -> dict[str, dict]:
     data = await _get_json(
-        session, "https://api.binance.com/api/v3/ticker/24hr"
+        session, "https://fapi.binance.com/fapi/v1/ticker/24hr"
     )
     if not data:
         return {}
@@ -105,7 +105,7 @@ async def get_price(
 ) -> float | None:
     data = await _get_json(
         session,
-        "https://api.binance.com/api/v3/ticker/price",
+        "https://fapi.binance.com/fapi/v1/ticker/price",
         {"symbol": symbol.upper()},
     )
     if data and "price" in data:
@@ -778,26 +778,76 @@ def aggregate_liquidations(
     return totals
 
 
-async def build_liquidations_text(window_minutes: int = 60) -> str:
-    """Текст с текущими ликвидациями за window_minutes."""
+def aggregate_liquidations_by_bucket(
+    orders: list[dict],
+    symbols: list[str],
+    bucket_hours: int = 6,
+    total_hours: int = 24,
+) -> tuple[dict[tuple[str, int], float], dict[str, float]]:
+    """Группировка ликвидаций по bucket_hours-часовым интервалам."""
     now_ms = int(time.time() * 1000)
-    start_ms = now_ms - window_minutes * 60 * 1000
+    cutoff_ms = now_ms - total_hours * 3600 * 1000
+    wanted = {s.upper() for s in symbols}
+    bucket_ms = bucket_hours * 3600 * 1000
+    buckets: dict[tuple[str, int], float] = {}
+    totals: dict[str, float] = {}
+    for o in orders:
+        sym = (o.get("symbol") or "").upper()
+        if wanted and sym not in wanted:
+            continue
+        ts = o.get("time") or 0
+        if ts < cutoff_ms or ts > now_ms:
+            continue
+        try:
+            price = float(o.get("price", 0))
+            qty = float(o.get("executedQty", 0))
+        except (TypeError, ValueError):
+            continue
+        if price <= 0 or qty <= 0:
+            continue
+        val = price * qty
+        bucket_idx = int((now_ms - ts) // bucket_ms)
+        key = (sym, bucket_idx)
+        buckets[key] = buckets.get(key, 0.0) + val
+        totals[sym] = totals.get(sym, 0.0) + val
+    return buckets, totals
+
+
+async def build_liquidations_text(hours: int = 24) -> str:
+    """Текст с ликвидациями за последние hours часов с разбивкой по интервалам."""
+    now_ms = int(time.time() * 1000)
+    bucket_hours = 6
+    all_orders: list[dict] = []
     async with _shared_session() as s:
-        orders = await fetch_all_force_orders(s, start_time_ms=start_ms, end_time_ms=now_ms, limit=1000)
-    totals = aggregate_liquidations(orders, config.LIQ_SYMBOLS, window_minutes=window_minutes)
+        # Разбиваем на 6-часовые интервалы, чтобы не терять данные из-за limit=1000
+        for i in range(hours // bucket_hours):
+            end_ms = now_ms - i * bucket_hours * 3600 * 1000
+            start_ms = end_ms - bucket_hours * 3600 * 1000
+            orders = await fetch_all_force_orders(
+                s, start_time_ms=start_ms, end_time_ms=end_ms, limit=1000
+            )
+            all_orders.extend(orders)
+    buckets, totals = aggregate_liquidations_by_bucket(
+        all_orders, config.LIQ_SYMBOLS, bucket_hours=bucket_hours, total_hours=hours
+    )
     if not totals:
         return (
-            f"💥 *Ликвидации за {window_minutes} мин*\n\n"
-            f"Нет крупных ликвидаций по `{', '.join(config.LIQ_SYMBOLS)}`."
+            f"💥 *Ликвидации за {hours}ч*\n\n"
+            f"Нет данных по `{', '.join(config.LIQ_SYMBOLS)}`."
         )
-    lines = [f"💥 *Ликвидации за {window_minutes} мин*\n"]
+    labels = ["0-6ч", "6-12ч", "12-18ч", "18-24ч"]
+    lines = [f"💥 *Ликвидации за {hours}ч*\n"]
     total_all = 0.0
     for sym in sorted(totals, key=totals.get, reverse=True):
         val = totals[sym]
         total_all += val
         coin = symbol_to_coin(sym)
-        lines.append(f"• *{coin}*: `{fmt_volume(val)}`")
-    lines.append(f"\n_Всего: {fmt_volume(total_all)}_")
+        lines.append(f"*{coin}* — всего `{fmt_volume(val)}`")
+        for idx, label in enumerate(labels):
+            bucket_val = buckets.get((sym, idx), 0.0)
+            lines.append(f"  {label}: `{fmt_volume(bucket_val)}`")
+        lines.append("")
+    lines.append(f"_Всего: {fmt_volume(total_all)}_")
     return "\n".join(lines)
 
 
