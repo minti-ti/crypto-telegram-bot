@@ -7,9 +7,12 @@ import json
 import logging
 import re
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
+
+import websockets
 
 import aiohttp
 import feedparser  # type: ignore
@@ -848,146 +851,87 @@ async def get_upcoming_macro_events(
     return out
 
 
-# ─────────────────────────── ликвидации (Binance forceOrders) ───
-async def fetch_force_orders(
-    session: aiohttp.ClientSession,
-    symbol: str | None = None,
-    start_time_ms: int | None = None,
-    end_time_ms: int | None = None,
-    limit: int = 1000,
-) -> list[dict]:
-    """Получить forceOrders с Binance Futures."""
-    params: dict[str, Any] = {"limit": limit}
-    if symbol:
-        params["symbol"] = symbol.upper()
-    if start_time_ms:
-        params["startTime"] = start_time_ms
-    if end_time_ms:
-        params["endTime"] = end_time_ms
-    data = await _get_json(
-        session,
-        "https://fapi.binance.com/fapi/v1/forceOrders",
-        params,
-    )
-    if not data or not isinstance(data, list):
-        return []
-    return data
+# ─────────────────────────── ликвидации (Binance WebSocket) ─────
+_LIQ_HISTORY: deque[dict] = deque()
+_LIQ_MAX_AGE_HOURS = 24
 
 
-async def fetch_all_force_orders(
-    session: aiohttp.ClientSession,
-    start_time_ms: int | None = None,
-    end_time_ms: int | None = None,
-    limit: int = 1000,
-) -> list[dict]:
-    """Все ликвидации за период."""
-    params: dict[str, Any] = {"limit": limit}
-    if start_time_ms:
-        params["startTime"] = start_time_ms
-    if end_time_ms:
-        params["endTime"] = end_time_ms
-    data = await _get_json(
-        session,
-        "https://fapi.binance.com/fapi/v1/allForceOrders",
-        params,
-    )
-    if not data or not isinstance(data, list):
-        # allForceOrders часто отдаёт 400/403, fallback на forceOrders по символам
-        all_orders: list[dict] = []
-        for sym in config.LIQ_SYMBOLS:
-            orders = await fetch_force_orders(
-                session, symbol=sym, start_time_ms=start_time_ms,
-                end_time_ms=end_time_ms, limit=limit,
-            )
-            all_orders.extend(orders)
-        return all_orders
-    return data
+def _add_liq_event(symbol: str, time_ms: int, usd: float) -> None:
+    """Сохранить ликвидацию в памяти, если символ из нужных."""
+    wanted = {s.upper() for s in config.LIQ_SYMBOLS}
+    if symbol.upper() not in wanted:
+        return
+    _LIQ_HISTORY.append({"symbol": symbol.upper(), "time": time_ms, "usd": usd})
+    cutoff_ms = int(time.time() * 1000) - _LIQ_MAX_AGE_HOURS * 3600 * 1000
+    while _LIQ_HISTORY and _LIQ_HISTORY[0]["time"] < cutoff_ms:
+        _LIQ_HISTORY.popleft()
 
 
-def aggregate_liquidations(
-    orders: list[dict],
-    symbols: list[str],
-    window_minutes: int = 60,
-) -> dict[str, float]:
-    """Сумма USD-ликвидаций за window_minutes по указанным символам."""
-    now_ms = int(time.time() * 1000)
-    cutoff_ms = now_ms - window_minutes * 60 * 1000
-    wanted = {s.upper() for s in symbols}
-    totals: dict[str, float] = {}
-    for o in orders:
-        sym = (o.get("symbol") or "").upper()
-        if wanted and sym not in wanted:
-            continue
-        ts = o.get("time") or 0
-        if ts < cutoff_ms:
-            continue
+async def _liq_websocket_loop() -> None:
+    """WebSocket-логгер ликвидаций Binance Futures. Переподключается при обрыве."""
+    url = "wss://fstream.binance.com/ws/!forceOrder@arr"
+    while True:
         try:
-            price = float(o.get("price", 0))
-            qty = float(o.get("executedQty", 0))
-        except (TypeError, ValueError):
-            continue
-        if price <= 0 or qty <= 0:
-            continue
-        totals[sym] = totals.get(sym, 0.0) + price * qty
-    return totals
+            log.info("Connecting to Binance liquidation websocket: %s", url)
+            async with websockets.connect(url) as ws:
+                async for raw in ws:
+                    try:
+                        data = json.loads(raw)
+                        if data.get("e") != "forceOrder":
+                            continue
+                        o = data.get("o", {})
+                        symbol = (o.get("s") or "").upper()
+                        if not symbol:
+                            continue
+                        time_ms = int(data.get("E") or time.time() * 1000)
+                        qty = float(o.get("z") or o.get("q") or 0)
+                        price = float(o.get("ap") or o.get("p") or 0)
+                        if qty <= 0 or price <= 0:
+                            continue
+                        usd = qty * price
+                        _add_liq_event(symbol, time_ms, usd)
+                    except Exception as e:
+                        log.warning("Liq websocket parse error: %s", e)
+        except Exception as e:
+            log.warning("Liq websocket connection error: %s", e)
+            await asyncio.sleep(5)
 
 
-def aggregate_liquidations_by_bucket(
-    orders: list[dict],
-    symbols: list[str],
+async def start_liq_websocket() -> None:
+    """Запускает фоновый WebSocket для ликвидаций."""
+    asyncio.create_task(_liq_websocket_loop())
+    log.info("Liquidation websocket started")
+
+
+def _aggregate_liq_history(
+    hours: int,
     bucket_hours: int = 6,
-    total_hours: int = 24,
 ) -> tuple[dict[tuple[str, int], float], dict[str, float]]:
-    """Группировка ликвидаций по bucket_hours-часовым интервалам."""
+    """Группировка ликвидаций из памяти."""
     now_ms = int(time.time() * 1000)
-    cutoff_ms = now_ms - total_hours * 3600 * 1000
-    wanted = {s.upper() for s in symbols}
+    cutoff_ms = now_ms - hours * 3600 * 1000
     bucket_ms = bucket_hours * 3600 * 1000
     buckets: dict[tuple[str, int], float] = {}
     totals: dict[str, float] = {}
-    for o in orders:
-        sym = (o.get("symbol") or "").upper()
-        if wanted and sym not in wanted:
+    for rec in _LIQ_HISTORY:
+        if rec["time"] < cutoff_ms:
             continue
-        ts = o.get("time") or 0
-        if ts < cutoff_ms or ts > now_ms:
-            continue
-        try:
-            price = float(o.get("price", 0))
-            qty = float(o.get("executedQty", 0))
-        except (TypeError, ValueError):
-            continue
-        if price <= 0 or qty <= 0:
-            continue
-        val = price * qty
-        bucket_idx = int((now_ms - ts) // bucket_ms)
+        sym = rec["symbol"]
+        bucket_idx = int((now_ms - rec["time"]) // bucket_ms)
         key = (sym, bucket_idx)
-        buckets[key] = buckets.get(key, 0.0) + val
-        totals[sym] = totals.get(sym, 0.0) + val
+        buckets[key] = buckets.get(key, 0.0) + rec["usd"]
+        totals[sym] = totals.get(sym, 0.0) + rec["usd"]
     return buckets, totals
 
 
 async def build_liquidations_text(hours: int = 24) -> str:
     """Текст с ликвидациями за последние hours часов с разбивкой по интервалам."""
-    now_ms = int(time.time() * 1000)
-    bucket_hours = 6
-    all_orders: list[dict] = []
-    async with _shared_session() as s:
-        # Разбиваем на 6-часовые интервалы, чтобы не терять данные из-за limit=1000
-        for i in range(hours // bucket_hours):
-            end_ms = now_ms - i * bucket_hours * 3600 * 1000
-            start_ms = end_ms - bucket_hours * 3600 * 1000
-            orders = await fetch_all_force_orders(
-                s, start_time_ms=start_ms, end_time_ms=end_ms, limit=1000
-            )
-            all_orders.extend(orders)
-    buckets, totals = aggregate_liquidations_by_bucket(
-        all_orders, config.LIQ_SYMBOLS, bucket_hours=bucket_hours, total_hours=hours
-    )
+    buckets, totals = _aggregate_liq_history(hours, bucket_hours=6)
     if not totals:
         return (
             f"💥 *Ликвидации за {hours}ч*\n\n"
-            f"Нет данных по `{', '.join(config.LIQ_SYMBOLS)}`."
+            f"Нет данных по `{', '.join(config.LIQ_SYMBOLS)}`.\n"
+            "_Данные собираются через WebSocket, подожди немного._"
         )
     labels = ["0-6ч", "6-12ч", "12-18ч", "18-24ч"]
     lines = [f"💥 *Ликвидации за {hours}ч*\n"]

@@ -1094,14 +1094,12 @@ async def liq_monitor_job() -> None:
     """Монитор крупных ликвидаций на Binance Futures."""
     try:
         now_ms = int(time.time() * 1000)
-        start_ms = now_ms - config.LIQ_LOOKBACK_MINUTES * 60 * 1000
-        async with services._shared_session() as s:
-            orders = await services.fetch_all_force_orders(
-                s, start_time_ms=start_ms, end_time_ms=now_ms, limit=1000
-            )
-        totals = services.aggregate_liquidations(
-            orders, config.LIQ_SYMBOLS, window_minutes=config.LIQ_LOOKBACK_MINUTES
-        )
+        cutoff_ms = now_ms - config.LIQ_LOOKBACK_MINUTES * 60 * 1000
+        totals: dict[str, float] = {}
+        for rec in services._LIQ_HISTORY:
+            if rec["time"] < cutoff_ms:
+                continue
+            totals[rec["symbol"]] = totals.get(rec["symbol"], 0.0) + rec["usd"]
         if not totals:
             return
         users = await db.all_morning_users()
@@ -1492,6 +1490,8 @@ async def on_startup() -> None:
     global _scheduler, _health_runner
     log.info("Bot starting...")
     await db.init_db()
+    # WebSocket для ликвидаций (Binance)
+    await services.start_liq_websocket()
     _scheduler = await setup_scheduler()
     _scheduler.start()
     log.info(
