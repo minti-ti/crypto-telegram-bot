@@ -33,7 +33,7 @@ COINGLASS_API_KEY: str = _get("COINGLASS_API_KEY")
 ECON_COUNTRIES: list[str] = [
     s.strip() for s in _get("ECON_COUNTRIES", "US,United States").split(",") if s.strip()
 ]
-ECON_MIN_IMPORTANCE: int = int(_get("ECON_MIN_IMPORTANCE", "3"))  # 1-3, 3 = high only
+ECON_MIN_IMPORTANCE: int = int(_get("ECON_MIN_IMPORTANCE", "2"))  # 1-3, 2 = medium+
 ECON_NOTIFY_MINUTES: int = int(_get("ECON_NOTIFY_MINUTES", "60"))  # за сколько минут предупреждать
 
 # ---- Ликвидации ----

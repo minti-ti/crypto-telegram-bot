@@ -596,17 +596,30 @@ def _filter_us_macro_events(events: list[dict]) -> list[dict]:
         if country not in ("US", "UNITED STATES", "USA"):
             continue
         event_name = (e.get("event") or "").upper()
-        impact = (e.get("impact") or "").lower()
-        if not any(kw in event_name for kw in US_ECON_KEYWORDS):
-            continue
-        if impact not in ("high", "medium") and not any(kw in event_name for kw in ("CPI", "NFP", "FOMC", "GDP", "PPI")):
-            continue
+
+        # impact у Finnhub — строка "1" / "2" / "3" (1=low, 2=medium, 3=high)
+        impact_raw = e.get("impact")
+        impact_val = 0
+        if isinstance(impact_raw, (int, float)):
+            impact_val = int(impact_raw)
+        elif isinstance(impact_raw, str):
+            impact_raw = impact_raw.strip().lower()
+            if impact_raw.isdigit():
+                impact_val = int(impact_raw)
+            else:
+                impact_val = {"low": 1, "medium": 2, "high": 3}.get(impact_raw, 0)
+
+        # ECON_MIN_IMPORTANCE по умолчанию 3 (high). Если хочешь medium — ставь 2 в .env
+        if impact_val < config.ECON_MIN_IMPORTANCE:
+            # но всё равно пропускаем, если это не явно важное ключевое слово
+            if not any(kw in event_name for kw in ("CPI", "NFP", "FOMC", "GDP", "PPI")):
+                continue
         out.append(e)
     return out
 
 
 def _parse_event_datetime(e: dict) -> datetime | None:
-    """Парсим date + time в datetime UTC."""
+    """Парсим date + time в datetime UTC. Finnhub возвращает ET (UTC-4/UTC-5)."""
     date_s = e.get("date") or ""
     time_s = e.get("time") or ""
     if not date_s:
@@ -621,8 +634,9 @@ def _parse_event_datetime(e: dict) -> datetime | None:
             dt = dt.replace(hour=hh, minute=mm)
         except Exception:
             pass
-    # Finnhub economic calendar — обычно время в EST (UTC-5/UTC-4).
-    # Для простоты считаем UTC, но при отображении пишем "EST".
+    # Приводим ET → UTC. Летом (EDT) UTC-4, зимой (EST) UTC-5.
+    # Для алертов ±1 час не критично, используем +4.
+    dt = dt + timedelta(hours=4)
     return dt.replace(tzinfo=timezone.utc)
 
 
@@ -637,8 +651,8 @@ def _fmt_event(e: dict) -> str:
     estimate = e.get("estimate")
     previous = e.get("previous")
     impact = (e.get("impact") or "").lower()
-    emoji = "🔥" if impact == "high" else "⚡" if impact == "medium" else "•"
-    parts = [f"{emoji} *{event}* — `{time_s} EST`"]
+    emoji = "🔥" if impact == "3" or impact == "high" else "⚡" if impact == "2" or impact == "medium" else "•"
+    parts = [f"{emoji} *{event}* — `{time_s} ET`"]
     vals = []
     if estimate is not None:
         vals.append(f"прогноз `{estimate}`")
@@ -661,7 +675,7 @@ async def build_econ_calendar_text(days: int = 1) -> str:
     events = _filter_us_macro_events(events)
     if not events:
         return "📅 *Экономический календарь*\n\nНет важных US-событий на ближайшие дни."
-    lines = [f"📅 *Экономический календарь (US)*\n_Время EST / UTC-5(4)_\n"]
+    lines = [f"📅 *Экономический календарь (US)*\n_Время ET (UTC-4/UTC-5)_\n"]
     for e in events[:20]:
         lines.append(_fmt_event(e))
     return "\n\n".join(lines)
