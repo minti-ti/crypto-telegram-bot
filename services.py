@@ -6,7 +6,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
 
@@ -557,6 +557,236 @@ def symbol_to_coin(symbol: str) -> str:
     return s
 
 
+# ─────────────────────────── экономический календарь (Finnhub) ──
+US_ECON_KEYWORDS = (
+    "CPI", "NFP", "NONFARM", "FOMC", "FED", "GDP", "PPI",
+    "UNEMPLOYMENT", "INTEREST RATE", "JOBLESS", "EMPLOYMENT",
+    "INFLATION", "RETAIL SALES", "INDUSTRIAL PRODUCTION",
+)
+
+
+async def fetch_economic_calendar(
+    session: aiohttp.ClientSession,
+    from_date: str,
+    to_date: str,
+) -> list[dict]:
+    """Finnhub economic calendar. from/to в формате YYYY-MM-DD."""
+    if not config.FINNHUB_API_KEY:
+        log.warning("FINNHUB_API_KEY not set, skipping calendar")
+        return []
+    data = await _get_json(
+        session,
+        "https://finnhub.io/api/v1/calendar/economic",
+        {
+            "from": from_date,
+            "to": to_date,
+            "token": config.FINNHUB_API_KEY,
+        },
+    )
+    if not data or "economicCalendar" not in data:
+        return []
+    return list(data["economicCalendar"])
+
+
+def _filter_us_macro_events(events: list[dict]) -> list[dict]:
+    """Оставляем только US macro events, которые влияют на рынок."""
+    out: list[dict] = []
+    for e in events:
+        country = (e.get("country") or "").upper()
+        if country not in ("US", "UNITED STATES", "USA"):
+            continue
+        event_name = (e.get("event") or "").upper()
+        impact = (e.get("impact") or "").lower()
+        if not any(kw in event_name for kw in US_ECON_KEYWORDS):
+            continue
+        if impact not in ("high", "medium") and not any(kw in event_name for kw in ("CPI", "NFP", "FOMC", "GDP", "PPI")):
+            continue
+        out.append(e)
+    return out
+
+
+def _parse_event_datetime(e: dict) -> datetime | None:
+    """Парсим date + time в datetime UTC."""
+    date_s = e.get("date") or ""
+    time_s = e.get("time") or ""
+    if not date_s:
+        return None
+    try:
+        dt = datetime.strptime(date_s, "%Y-%m-%d")
+    except ValueError:
+        return None
+    if time_s and time_s != "TBA":
+        try:
+            hh, mm = map(int, time_s.split(":"))
+            dt = dt.replace(hour=hh, minute=mm)
+        except Exception:
+            pass
+    # Finnhub economic calendar — обычно время в EST (UTC-5/UTC-4).
+    # Для простоты считаем UTC, но при отображении пишем "EST".
+    return dt.replace(tzinfo=timezone.utc)
+
+
+def _event_id(e: dict) -> str:
+    return f"{e.get('date', '')}|{e.get('time', '')}|{e.get('country', '')}|{e.get('event', '')}"
+
+
+def _fmt_event(e: dict) -> str:
+    event = e.get("event", "")
+    time_s = e.get("time") or "TBA"
+    actual = e.get("actual")
+    estimate = e.get("estimate")
+    previous = e.get("previous")
+    impact = (e.get("impact") or "").lower()
+    emoji = "🔥" if impact == "high" else "⚡" if impact == "medium" else "•"
+    parts = [f"{emoji} *{event}* — `{time_s} EST`"]
+    vals = []
+    if estimate is not None:
+        vals.append(f"прогноз `{estimate}`")
+    if previous is not None:
+        vals.append(f"предыдущее `{previous}`")
+    if actual is not None:
+        vals.append(f"факт `{actual}`")
+    if vals:
+        parts.append(f"  _{' · '.join(vals)}_")
+    return "\n".join(parts)
+
+
+async def build_econ_calendar_text(days: int = 1) -> str:
+    """Собрать текст календаря на ближайшие дни."""
+    today = datetime.now(timezone.utc)
+    from_date = today.strftime("%Y-%m-%d")
+    to_date = (today + timedelta(days=days)).strftime("%Y-%m-%d")
+    async with _shared_session() as s:
+        events = await fetch_economic_calendar(s, from_date, to_date)
+    events = _filter_us_macro_events(events)
+    if not events:
+        return "📅 *Экономический календарь*\n\nНет важных US-событий на ближайшие дни."
+    lines = [f"📅 *Экономический календарь (US)*\n_Время EST / UTC-5(4)_\n"]
+    for e in events[:20]:
+        lines.append(_fmt_event(e))
+    return "\n\n".join(lines)
+
+
+async def get_upcoming_macro_events(
+    session: aiohttp.ClientSession,
+    within_minutes: int = 60,
+) -> list[dict]:
+    """Вернуть события, которые произойдут в ближайшие within_minutes."""
+    now = datetime.now(timezone.utc)
+    from_date = now.strftime("%Y-%m-%d")
+    to_date = (now + timedelta(days=2)).strftime("%Y-%m-%d")
+    events = await fetch_economic_calendar(session, from_date, to_date)
+    events = _filter_us_macro_events(events)
+    out: list[dict] = []
+    for e in events:
+        dt = _parse_event_datetime(e)
+        if not dt:
+            continue
+        delta = (dt - now).total_seconds() / 60
+        if 0 < delta <= within_minutes:
+            out.append(e)
+    return out
+
+
+# ─────────────────────────── ликвидации (Binance forceOrders) ───
+async def fetch_force_orders(
+    session: aiohttp.ClientSession,
+    symbol: str | None = None,
+    start_time_ms: int | None = None,
+    end_time_ms: int | None = None,
+    limit: int = 1000,
+) -> list[dict]:
+    """Получить forceOrders с Binance Futures."""
+    params: dict[str, Any] = {"limit": limit}
+    if symbol:
+        params["symbol"] = symbol.upper()
+    if start_time_ms:
+        params["startTime"] = start_time_ms
+    if end_time_ms:
+        params["endTime"] = end_time_ms
+    data = await _get_json(
+        session,
+        "https://fapi.binance.com/fapi/v1/forceOrders",
+        params,
+    )
+    if not data or not isinstance(data, list):
+        return []
+    return data
+
+
+async def fetch_all_force_orders(
+    session: aiohttp.ClientSession,
+    start_time_ms: int | None = None,
+    end_time_ms: int | None = None,
+    limit: int = 1000,
+) -> list[dict]:
+    """Все ликвидации за период."""
+    params: dict[str, Any] = {"limit": limit}
+    if start_time_ms:
+        params["startTime"] = start_time_ms
+    if end_time_ms:
+        params["endTime"] = end_time_ms
+    data = await _get_json(
+        session,
+        "https://fapi.binance.com/fapi/v1/allForceOrders",
+        params,
+    )
+    if not data or not isinstance(data, list):
+        return []
+    return data
+
+
+def aggregate_liquidations(
+    orders: list[dict],
+    symbols: list[str],
+    window_minutes: int = 60,
+) -> dict[str, float]:
+    """Сумма USD-ликвидаций за window_minutes по указанным символам."""
+    now_ms = int(time.time() * 1000)
+    cutoff_ms = now_ms - window_minutes * 60 * 1000
+    wanted = {s.upper() for s in symbols}
+    totals: dict[str, float] = {}
+    for o in orders:
+        sym = (o.get("symbol") or "").upper()
+        if wanted and sym not in wanted:
+            continue
+        ts = o.get("time") or 0
+        if ts < cutoff_ms:
+            continue
+        try:
+            price = float(o.get("price", 0))
+            qty = float(o.get("executedQty", 0))
+        except (TypeError, ValueError):
+            continue
+        if price <= 0 or qty <= 0:
+            continue
+        totals[sym] = totals.get(sym, 0.0) + price * qty
+    return totals
+
+
+async def build_liquidations_text(window_minutes: int = 60) -> str:
+    """Текст с текущими ликвидациями за window_minutes."""
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - window_minutes * 60 * 1000
+    async with _shared_session() as s:
+        orders = await fetch_all_force_orders(s, start_time_ms=start_ms, end_time_ms=now_ms, limit=1000)
+    totals = aggregate_liquidations(orders, config.LIQ_SYMBOLS, window_minutes=window_minutes)
+    if not totals:
+        return (
+            f"💥 *Ликвидации за {window_minutes} мин*\n\n"
+            f"Нет крупных ликвидаций по `{', '.join(config.LIQ_SYMBOLS)}`."
+        )
+    lines = [f"💥 *Ликвидации за {window_minutes} мин*\n"]
+    total_all = 0.0
+    for sym in sorted(totals, key=totals.get, reverse=True):
+        val = totals[sym]
+        total_all += val
+        coin = symbol_to_coin(sym)
+        lines.append(f"• *{coin}*: `{fmt_volume(val)}`")
+    lines.append(f"\n_Всего: {fmt_volume(total_all)}_")
+    return "\n".join(lines)
+
+
 # ─────────────────────────── утренняя сводка ────────────────────
 async def build_morning_briefing() -> str:
     lines: list[str] = []
@@ -565,12 +795,21 @@ async def build_morning_briefing() -> str:
     lines.append("")
 
     async with _shared_session() as s:
-        fg, tickers, global_m, funding = await asyncio.gather(
+        fg, tickers, global_m, funding, cal_events = await asyncio.gather(
             get_fear_greed(s),
             get_24h_tickers(s, config.TOP_SYMBOLS),
             get_global_market(s),
             asyncio.gather(*[get_funding_rate(s, x) for x in config.FUNDING_SYMBOLS]),
+            fetch_economic_calendar(s, today, today),
         )
+
+    if cal_events:
+        us_events = _filter_us_macro_events(cal_events)
+        if us_events:
+            lines.append("📅 *Важные US-события сегодня:*")
+            for e in us_events[:5]:
+                lines.append(_fmt_event(e))
+            lines.append("")
 
     if fg:
         lines.append(

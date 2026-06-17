@@ -72,6 +72,20 @@ async def _create_tables(conn: asyncpg.Connection) -> None:
             value      TEXT NOT NULL,
             updated_at BIGINT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS sent_econ_events (
+            event_id   TEXT PRIMARY KEY,
+            alert_type TEXT NOT NULL,
+            sent_at    BIGINT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS liq_alerts (
+            id            BIGSERIAL PRIMARY KEY,
+            symbol        TEXT NOT NULL,
+            total_usd     DOUBLE PRECISION NOT NULL,
+            window_minutes INT NOT NULL DEFAULT 60,
+            alerted_at    BIGINT NOT NULL
+        );
     """)
 
 
@@ -273,3 +287,40 @@ async def set_setting(key: str, value: str) -> None:
                updated_at = EXCLUDED.updated_at""",
         key, value, _now(),
     )
+
+
+# ─────────────────────────── Economic calendar ───────────────────
+async def is_econ_event_sent(event_id: str, alert_type: str) -> bool:
+    row = await _fetchone(
+        "SELECT 1 FROM sent_econ_events WHERE event_id = $1 AND alert_type = $2",
+        event_id, alert_type,
+    )
+    return row is not None
+
+
+async def mark_econ_event_sent(event_id: str, alert_type: str) -> None:
+    await _execute(
+        """INSERT INTO sent_econ_events(event_id, alert_type, sent_at)
+           VALUES ($1, $2, $3)
+           ON CONFLICT DO NOTHING""",
+        event_id, alert_type, _now(),
+    )
+
+
+# ─────────────────────────── Liquidations ────────────────────────
+async def add_liq_alert(symbol: str, total_usd: float, window_minutes: int = 60) -> None:
+    await _execute(
+        """INSERT INTO liq_alerts(symbol, total_usd, window_minutes, alerted_at)
+           VALUES ($1, $2, $3, $4)""",
+        symbol.upper(), total_usd, window_minutes, _now(),
+    )
+
+
+async def recent_liq_alert(symbol: str, cooldown_minutes: int = 60) -> bool:
+    """Был ли алерт по символу за последние cooldown_minutes."""
+    cutoff = _now() - cooldown_minutes * 60
+    row = await _fetchone(
+        "SELECT 1 FROM liq_alerts WHERE symbol = $1 AND alerted_at > $2",
+        symbol.upper(), cutoff,
+    )
+    return row is not None

@@ -5,10 +5,12 @@ import asyncio
 import logging
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F, Router, types
+from aiogram.types import InlineKeyboardMarkup
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
@@ -25,7 +27,7 @@ from keyboards import (
     main_menu_kb,
     kb_price, kb_market, kb_news_my_subs, kb_news_after,
     kb_alerts_list, kb_alert_confirm,
-    kb_subs_current, kb_settime, kb_calc,
+    kb_subs_current, kb_settime, kb_calc, kb_calendar, kb_liq,
     cancel_kb,
 )
 
@@ -46,6 +48,34 @@ dp.include_router(router)
 # Глобальный scheduler (для reschedule из /settime)
 _scheduler: AsyncIOScheduler | None = None
 _health_runner: web.AppRunner | None = None
+
+
+# ─────────────────────────── helper: edit-in-place ───────────────
+async def _send_or_edit(
+    target: types.Message | types.CallbackQuery,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    disable_web_page_preview: bool = False,
+    parse_mode: str = ParseMode.MARKDOWN,
+) -> types.Message:
+    """Редактирует сообщение, если target — CallbackQuery, иначе отправляет новое."""
+    msg = target if isinstance(target, types.Message) else target.message
+    if not msg:
+        raise ValueError("No message to edit or send")
+    try:
+        return await msg.edit_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+        )
+    except Exception:
+        return await msg.answer(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+        )
 
 
 # ─────────────────────────── FSM ───────────────────────────────
@@ -83,9 +113,13 @@ HELP_TEXT = (
     "`/price <тикер>` — цена (напр. `/price BTC`)\n"
     "`/fg` — Fear & Greed Index\n"
     "`/funding` — funding rate BTC/ETH/SOL\n"
+    "`/oi BTC` — Open Interest за 24ч\n"
     "`/news [BTC,ETH,...]` — важные новости по монетам\n"
     "`/top` — топ рост/падение за 24ч\n"
-    "`/convert` — конвертер криптовалют\n\n"
+    "`/convert` — конвертер криптовалют\n"
+    "`/calendar` — экономический календарь (US)\n"
+    "`/liq` — ликвидации за час (BTC/ETH)\n"
+    "`/calc` — калькулятор позиции\n\n"
     "*Алерты:*\n"
     "`/alert BTCUSDT above 70000` — сработает при пробое 70000\n"
     "`/alerts` — список\n"
@@ -97,6 +131,7 @@ HELP_TEXT = (
     "*Прочее:*\n"
     "`/morning on|off` — утренняя сводка\n"
     "`/briefing` — прислать сводку сейчас\n"
+    "`/settime HH:MM` — время сводки\n"
     "`/help` — эта справка"
 )
 
@@ -124,72 +159,61 @@ async def cb_menu(c: types.CallbackQuery, state: FSMContext) -> None:
     cmd = c.data.split(":", 1)[1]
     await c.answer()
 
-    # Для меню-кнопок редактируем текущее сообщение, чтобы не захламлять чат
-    # (кроме news - там длинные сообщения)
-    msg = c.message
-    if cmd not in ("news", "price"):
-        # monkey-patch answer -> edit_text
-        original_answer = msg.answer
-        async def edit_answer(text, reply_markup=None, **kwargs):
-            try:
-                await msg.edit_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN, **kwargs)
-                return msg
-            except Exception:
-                return await original_answer(text, reply_markup=reply_markup, **kwargs)
-        msg.answer = edit_answer  # type: ignore
-
-    # Простые команды — вызываем соответствующий хендлер
+    if cmd == "menu":
+        await _send_or_edit(c, "🏠 *Главное меню*", reply_markup=main_menu_kb())
+        return
     if cmd == "fg":
-        await _send_fg(msg)
+        await _send_fg(c)
         return
     if cmd == "funding":
-        await _send_funding(msg)
+        await _send_funding(c)
         return
     if cmd == "alerts":
-        await cmd_alerts(msg)
+        await _show_alerts(c)
         return
     if cmd == "subs":
-        await cmd_mysubs(msg)
+        await _show_subs(c)
         return
     if cmd == "top":
-        await cmd_top(msg)
+        await _send_top(c)
         return
     if cmd == "briefing":
-        await cmd_briefing(msg)
+        await _send_briefing(c)
         return
     if cmd == "oi":
-        from aiogram.filters import CommandObject
-        await cmd_oi(msg, CommandObject(prefix="/", command="oi", args=None))
+        await _send_oi_top(c)
         return
     if cmd == "calc":
-        await cmd_calc(msg)
+        await _send_or_edit(
+            c,
+            "📊 *Калькулятор позиции (Risk Management)*\n\n"
+            "Задай риск → получи размер позиции автоматически.\n\n"
+            "Выбери сторону:",
+            reply_markup=kb_calc(),
+        )
         return
     if cmd == "settime":
-        from aiogram.filters import CommandObject
-        await cmd_settime(msg, CommandObject(prefix="/", command="settime", args=None))
-        return
-    if cmd == "menu":
-        try:
-            await c.message.edit_text(
-                "🏠 *Главное меню*",
-                reply_markup=main_menu_kb(),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception:
-            await c.message.answer(
-                "🏠 *Главное меню*",
-                reply_markup=main_menu_kb(),
-            )
+        current = await db.get_setting("morning_time") or config.MORNING_TIME
+        await _send_or_edit(
+            c,
+            f"⏰ *Текущее время утренней сводки:* `{current}` MSK\n\n"
+            "Изменить: `/settime HH:MM` (например `/settime 08:30`)\n"
+            "Или нажми кнопку ниже:",
+            reply_markup=kb_settime(current),
+        )
         return
     if cmd == "news":
-        await c.message.answer(
-            "Введи монеты через запятую, например: `BTC,ETH`, "
-            "или просто `/news` для важных по рынку.",
-            reply_markup=kb_market(),
+        subs = await db.get_user_subs(c.from_user.id)
+        await _send_or_edit(
+            c,
+            "📰 *Новости — выбери монету:*\n"
+            "_Твои подписки сверху. Если нужна другая — нажми 'Другая монета' снизу._",
+            reply_markup=kb_news_my_subs(subs),
         )
         return
     if cmd == "price":
-        await c.message.answer(
+        await _send_or_edit(
+            c,
             "Укажи тикер. Примеры:\n"
             "• `/price BTC`\n"
             "• `/price BTCUSDT`",
@@ -198,17 +222,17 @@ async def cb_menu(c: types.CallbackQuery, state: FSMContext) -> None:
         return
     if cmd == "morning":
         new_val = await db.toggle_morning(c.from_user.id)
-        try:
-            await c.message.edit_text(
-                f"🌅 Утренняя сводка: {'включена ✅' if new_val else 'выключена ❌'}",
-                reply_markup=kb_market(),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception:
-            await c.message.answer(
-                f"🌅 Утренняя сводка: {'включена ✅' if new_val else 'выключена ❌'}",
-                reply_markup=kb_market(),
-            )
+        await _send_or_edit(
+            c,
+            f"🌅 Утренняя сводка: {'включена ✅' if new_val else 'выключена ❌'}",
+            reply_markup=kb_market(),
+        )
+        return
+    if cmd == "calendar":
+        await _send_calendar(c)
+        return
+    if cmd == "liq":
+        await _send_liq(c)
         return
 
 
@@ -216,7 +240,7 @@ async def cb_menu(c: types.CallbackQuery, state: FSMContext) -> None:
 async def cb_cancel(c: types.CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await c.answer("Отменено")
-    await c.message.edit_text("❌ Отменено.")
+    await _send_or_edit(c, "❌ Отменено.", reply_markup=main_menu_kb())
 
 
 # ─────────────────────────── /price ─────────────────────────────
@@ -264,13 +288,14 @@ async def cmd_price(m: types.Message, command: CommandObject) -> None:
 
 
 # ─────────────────────────── /fg ────────────────────────────────
-async def _send_fg(m: types.Message) -> None:
+async def _send_fg(target: types.Message | types.CallbackQuery) -> None:
     async with services._shared_session() as s:
         fg = await services.get_fear_greed(s)
     if not fg:
-        await m.answer("⚠️ Не удалось получить Fear & Greed Index.", reply_markup=kb_market())
+        await _send_or_edit(target, "⚠️ Не удалось получить Fear & Greed Index.", reply_markup=kb_market())
         return
-    await m.answer(
+    await _send_or_edit(
+        target,
         f"😱 *Fear & Greed Index*\n"
         f"Значение: *{fg['value']}* — {services.fear_greed_emoji(fg['value'])}\n"
         f"_Обновлено: {datetime.fromtimestamp(fg['timestamp'], tz=timezone.utc).strftime('%d.%m.%Y %H:%M UTC')}_",
@@ -284,14 +309,14 @@ async def cmd_fg(m: types.Message) -> None:
 
 
 # ─────────────────────────── /funding ──────────────────────────
-async def _send_funding(m: types.Message) -> None:
+async def _send_funding(target: types.Message | types.CallbackQuery) -> None:
     async with services._shared_session() as s:
         results = await asyncio.gather(
             *[services.get_funding_rate(s, x) for x in config.FUNDING_SYMBOLS]
         )
     valid = [r for r in results if r]
     if not valid:
-        await m.answer("⚠️ Не удалось получить funding rate.", reply_markup=kb_market())
+        await _send_or_edit(target, "⚠️ Не удалось получить funding rate.", reply_markup=kb_market())
         return
     lines = ["💸 *Funding rate (текущий):*"]
     for r in valid:
@@ -306,7 +331,7 @@ async def _send_funding(m: types.Message) -> None:
             f"_mark {services.fmt_usd(r['markPrice'])}_\n"
             f"  Следующее списание: {next_dt}"
         )
-    await m.answer("\n".join(lines), reply_markup=kb_market())
+    await _send_or_edit(target, "\n".join(lines), reply_markup=kb_market())
 
 
 @router.message(Command("funding"))
@@ -369,12 +394,13 @@ async def cmd_news(m: types.Message, command: CommandObject) -> None:
     )
 
 
-async def _show_news(m: types.Message, currencies: list[str]) -> None:
-    """Собрать новости и отправить."""
-    await m.answer("⏳ Собираю новости...")
+async def _show_news(target: types.Message | types.CallbackQuery, currencies: list[str]) -> None:
+    """Собрать новости и отправить/отредактировать."""
+    await _send_or_edit(target, "⏳ Собираю новости...")
     raw = await services.fetch_rss_feeds(lookback_hours=24)
     if not raw:
-        await m.answer(
+        await _send_or_edit(
+            target,
             "⚠️ Не удалось получить новости из RSS.",
             reply_markup=kb_news_my_subs([]),
         )
@@ -383,15 +409,15 @@ async def _show_news(m: types.Message, currencies: list[str]) -> None:
     text = _format_news_message(items, currencies)
     coin = currencies[0] if currencies and currencies[0] != "ALL" else None
     if coin:
-        await m.answer(text, disable_web_page_preview=True,
-                       reply_markup=kb_news_after(coin))
+        await _send_or_edit(target, text, disable_web_page_preview=True,
+                            reply_markup=kb_news_after(coin))
     else:
-        await m.answer(text, disable_web_page_preview=True,
-                       reply_markup=kb_news_my_subs([]))
+        await _send_or_edit(target, text, disable_web_page_preview=True,
+                            reply_markup=kb_news_my_subs([]))
 
 
 # ─────────────────────────── /oi (Open Interest) ────────────────
-async def _send_oi(m: types.Message, symbol: str) -> None:
+async def _send_oi(target: types.Message | types.CallbackQuery, symbol: str) -> None:
     """Показать Open Interest для монеты."""
     sym = symbol.upper()
     if not sym.endswith("USDT"):
@@ -399,7 +425,8 @@ async def _send_oi(m: types.Message, symbol: str) -> None:
     async with services._shared_session() as s:
         result = await services.get_oi_change_24h(s, sym)
     if not result:
-        await m.answer(
+        await _send_or_edit(
+            target,
             f"⚠️ Не удалось получить OI для `{sym}`.\n"
             "_Возможно, Binance недоступен с этого региона._",
             reply_markup=kb_market(),
@@ -436,61 +463,55 @@ async def _send_oi(m: types.Message, symbol: str) -> None:
     msg += "• Цена ↓ + OI ↑ = паника, шорты наращивают\n"
     msg += "• Цена ↓ + OI ↓ = лонги закрываются"
 
-    await m.answer(msg, reply_markup=kb_market())
+    await _send_or_edit(target, msg, reply_markup=kb_market())
+
+
+async def _send_oi_top(target: types.Message | types.CallbackQuery) -> None:
+    """Показать OI топ-3 для кнопки меню."""
+    async with services._shared_session() as s:
+        results = await asyncio.gather(
+            *[services.get_oi_change_24h(s, sym)
+              for sym in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]],
+            return_exceptions=True,
+        )
+    valid = [r for r in results if r and not isinstance(r, Exception)]
+    if not valid:
+        await _send_or_edit(
+            target,
+            "⚠️ Не удалось получить OI.\n_Возможно, Binance недоступен._",
+            reply_markup=kb_market(),
+        )
+        return
+    lines = ["📊 *Open Interest (топ-3):*\n"]
+    coins = ["BTC", "ETH", "SOL"]
+    for i, r in enumerate(valid):
+        if i >= len(coins):
+            break
+        coin = coins[i]
+        arrow = "🟢" if r["change"] >= 0 else "🔴"
+        lines.append(
+            f"• *{coin}*: {arrow} `{r['change_pct']:+.2f}%` за 24ч"
+        )
+    lines.append("\n_Конкретная монета: `/oi BTC` или `/oi ETH`_")
+    await _send_or_edit(target, "\n".join(lines), reply_markup=kb_market())
 
 
 @router.message(Command("oi"))
 async def cmd_oi(m: types.Message, command: CommandObject) -> None:
     if not command.args:
-        # Показать для нескольких топ-монет
-        async with services._shared_session() as s:
-            results = await asyncio.gather(
-                *[services.get_oi_change_24h(s, sym)
-                  for sym in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]],
-                return_exceptions=True,
-            )
-        valid = [r for r in results if r and not isinstance(r, Exception)]
-        if not valid:
-            await m.answer(
-                "⚠️ Не удалось получить OI.\n_Возможно, Binance недоступен._",
-                reply_markup=kb_market(),
-            )
-            return
-        lines = ["📊 *Open Interest (топ-3):*\n"]
-        for r in valid:
-            coin = services.symbol_to_coin(r["current_oi_symbol"]) if "current_oi_symbol" in r else None
-        # У нас нет current_oi_symbol, вычислим из change_usd
-        # Проще — пересоберём
-        coins_data = {
-            "BTCUSDT": ("BTC", None),
-            "ETHUSDT": ("ETH", None),
-            "SOLUSDT": ("SOL", None),
-        }
-        idx = 0
-        for sym, (coin, _) in list(coins_data.items()):
-            if idx >= len(valid):
-                break
-            r = valid[idx]
-            idx += 1
-            arrow = "🟢" if r["change"] >= 0 else "🔴"
-            lines.append(
-                f"• *{coin}*: {arrow} `{r['change_pct']:+.2f}%` за 24ч"
-            )
-        lines.append("\n_Конкретная монета: `/oi BTC` или `/oi ETH`_")
-        await m.answer("\n".join(lines), reply_markup=kb_market())
+        await _send_oi_top(m)
         return
     await _send_oi(m, command.args.strip())
 
 
 # ─────────────────────────── /top ───────────────────────────────
-@router.message(Command("top"))
-async def cmd_top(m: types.Message) -> None:
+async def _send_top(target: types.Message | types.CallbackQuery) -> None:
     async with services._shared_session() as s:
         data = await services._get_json(
             s, "https://api.binance.com/api/v3/ticker/24hr"
         )
     if not data:
-        await m.answer("⚠️ Не удалось получить данные.", reply_markup=kb_market())
+        await _send_or_edit(target, "⚠️ Не удалось получить данные.", reply_markup=kb_market())
         return
     # фильтруем USDT-пары с достаточным объёмом
     rows = []
@@ -516,7 +537,12 @@ async def cmd_top(m: types.Message) -> None:
     lines.append("\n📉 *Топ-5 падения за 24ч:*")
     for coin, price, ch, _vol in losers:
         lines.append(f"  • *{coin}*: {services.fmt_usd(price)} {services.fmt_pct(ch)}")
-    await m.answer("\n".join(lines), reply_markup=kb_market())
+    await _send_or_edit(target, "\n".join(lines), reply_markup=kb_market())
+
+
+@router.message(Command("top"))
+async def cmd_top(m: types.Message) -> None:
+    await _send_top(m)
 
 
 # ─────────────────────────── /convert ───────────────────────────
@@ -659,8 +685,10 @@ async def cmd_alert(m: types.Message, command: CommandObject) -> None:
 @router.callback_query(F.data == "alert:start")
 async def cb_alert_start(c: types.CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AddAlert.waiting_symbol)
-    await c.message.answer(
-        "Введи тикер монеты (например `BTC` или `BTCUSDT`):"
+    await _send_or_edit(
+        c,
+        "Введи тикер монеты (например `BTC` или `BTCUSDT`):",
+        reply_markup=cancel_kb(),
     )
     await c.answer()
 
@@ -694,7 +722,7 @@ async def cb_alert_dir(c: types.CallbackQuery, state: FSMContext) -> None:
     direction = c.data.split(":")[2]
     await state.update_data(direction=direction)
     await state.set_state(AddAlert.waiting_price)
-    await c.message.answer("Введи целевую цену (число):")
+    await _send_or_edit(c, "Введи целевую цену (число):", reply_markup=cancel_kb())
     await c.answer()
 
 
@@ -718,12 +746,15 @@ async def alert_price(m: types.Message, state: FSMContext) -> None:
     )
 
 
-@router.message(Command("alerts"))
-async def cmd_alerts(m: types.Message) -> None:
-    rows = await db.list_user_alerts(m.from_user.id)
+async def _show_alerts(target: types.Message | types.CallbackQuery) -> None:
+    user_id = target.from_user.id if hasattr(target, "from_user") else target.chat.id
+    rows = await db.list_user_alerts(user_id)
     if not rows:
-        await m.answer("У тебя нет алертов. Создай: `/alert BTCUSDT above 70000`",
-                       reply_markup=kb_alerts_list([]))
+        await _send_or_edit(
+            target,
+            "У тебя нет алертов. Создай: `/alert BTCUSDT above 70000`",
+            reply_markup=kb_alerts_list([]),
+        )
         return
     lines = ["🚨 *Твои алерты:*"]
     for r in rows:
@@ -733,7 +764,12 @@ async def cmd_alerts(m: types.Message) -> None:
             f"• *#{r['id']}* `{coin}` {r['direction']} {r['price']:g} — {status}"
         )
     lines.append("\nУдалить: `/delalert <id>`")
-    await m.answer("\n".join(lines), reply_markup=kb_alerts_list([]))
+    await _send_or_edit(target, "\n".join(lines), reply_markup=kb_alerts_list([]))
+
+
+@router.message(Command("alerts"))
+async def cmd_alerts(m: types.Message) -> None:
+    await _show_alerts(m)
 
 
 @router.message(Command("delalert"))
@@ -777,17 +813,26 @@ async def cmd_unsubscribe(m: types.Message, command: CommandObject) -> None:
     await m.answer(f"🗑 Удалено подписок: *{removed}*.", reply_markup=kb_subs_current(subs))
 
 
-@router.message(Command("mysubs"))
-async def cmd_mysubs(m: types.Message) -> None:
-    subs = await db.get_user_subs(m.from_user.id)
+async def _show_subs(target: types.Message | types.CallbackQuery) -> None:
+    user_id = target.from_user.id if hasattr(target, "from_user") else target.chat.id
+    subs = await db.get_user_subs(user_id)
     if not subs:
-        await m.answer("Нет подписок. Добавь: `/subscribe BTC,ETH`",
-                       reply_markup=kb_subs_current([]))
+        await _send_or_edit(
+            target,
+            "Нет подписок. Добавь: `/subscribe BTC,ETH`",
+            reply_markup=kb_subs_current([]),
+        )
         return
-    await m.answer(
+    await _send_or_edit(
+        target,
         "🔔 *Твои подписки:*\n" + ", ".join(f"`{s}`" for s in subs),
         reply_markup=kb_subs_current(subs),
     )
+
+
+@router.message(Command("mysubs"))
+async def cmd_mysubs(m: types.Message) -> None:
+    await _show_subs(m)
 
 
 # ─────────────────────────── утренняя сводка ────────────────────
@@ -811,11 +856,39 @@ async def cmd_morning(m: types.Message, command: CommandObject) -> None:
         await m.answer("Аргумент: `on` или `off`.", reply_markup=kb_market())
 
 
+async def _send_briefing(target: types.Message | types.CallbackQuery) -> None:
+    await _send_or_edit(target, "⏳ Собираю сводку...")
+    text = await services.build_morning_briefing()
+    await _send_or_edit(target, text, disable_web_page_preview=True, reply_markup=kb_market())
+
+
 @router.message(Command("briefing"))
 async def cmd_briefing(m: types.Message) -> None:
-    await m.answer("⏳ Собираю сводку...")
-    text = await services.build_morning_briefing()
-    await m.answer(text, disable_web_page_preview=True, reply_markup=kb_market())
+    await _send_briefing(m)
+
+
+# ─────────────────────────── /calendar ──────────────────────────
+async def _send_calendar(target: types.Message | types.CallbackQuery) -> None:
+    await _send_or_edit(target, "⏳ Загружаю календарь...")
+    text = await services.build_econ_calendar_text(days=2)
+    await _send_or_edit(target, text, reply_markup=kb_calendar(), disable_web_page_preview=True)
+
+
+@router.message(Command("calendar"))
+async def cmd_calendar(m: types.Message) -> None:
+    await _send_calendar(m)
+
+
+# ─────────────────────────── /liq ─────────────────────────────────
+async def _send_liq(target: types.Message | types.CallbackQuery) -> None:
+    await _send_or_edit(target, "⏳ Считаю ликвидации...")
+    text = await services.build_liquidations_text(window_minutes=60)
+    await _send_or_edit(target, text, reply_markup=kb_liq())
+
+
+@router.message(Command("liq"))
+async def cmd_liq(m: types.Message) -> None:
+    await _send_liq(m)
 
 
 # ─────────────────────────── периодические задачи ───────────────
@@ -955,6 +1028,80 @@ async def check_news_job() -> None:
              sent_count, len(items), len(new_items))
 
 
+async def econ_calendar_job() -> None:
+    """Алерт за 60 минут до важных US macro-событий."""
+    if not config.FINNHUB_API_KEY:
+        return
+    try:
+        async with services._shared_session() as s:
+            events = await services.get_upcoming_macro_events(
+                s, within_minutes=config.ECON_NOTIFY_MINUTES
+            )
+        if not events:
+            return
+        users = await db.all_morning_users()
+        if not users:
+            return
+        for e in events:
+            event_id = services._event_id(e)
+            if await db.is_econ_event_sent(event_id, "60min"):
+                continue
+            await db.mark_econ_event_sent(event_id, "60min")
+            text = (
+                f"📅 *Важное событие через {config.ECON_NOTIFY_MINUTES} мин*\n\n"
+                f"{services._fmt_event(e)}\n\n"
+                f"_Будьте внимательны к волатильности._"
+            )
+            for uid in users:
+                try:
+                    await bot.send_message(uid, text, disable_web_page_preview=True)
+                except Exception as ex:
+                    log.warning("Failed to send econ alert to %s: %s", uid, ex)
+        log.info("Econ calendar job: %s events, %s users", len(events), len(users))
+    except Exception as e:
+        log.exception("Econ calendar job error: %s", e)
+
+
+async def liq_monitor_job() -> None:
+    """Монитор крупных ликвидаций на Binance Futures."""
+    try:
+        now_ms = int(time.time() * 1000)
+        start_ms = now_ms - config.LIQ_LOOKBACK_MINUTES * 60 * 1000
+        async with services._shared_session() as s:
+            orders = await services.fetch_all_force_orders(
+                s, start_time_ms=start_ms, end_time_ms=now_ms, limit=1000
+            )
+        totals = services.aggregate_liquidations(
+            orders, config.LIQ_SYMBOLS, window_minutes=config.LIQ_LOOKBACK_MINUTES
+        )
+        if not totals:
+            return
+        users = await db.all_morning_users()
+        if not users:
+            return
+        for sym, total_usd in totals.items():
+            if total_usd < config.LIQ_THRESHOLD_USD:
+                continue
+            if await db.recent_liq_alert(sym, cooldown_minutes=config.LIQ_COOLDOWN_MINUTES):
+                continue
+            await db.add_liq_alert(sym, total_usd, window_minutes=config.LIQ_LOOKBACK_MINUTES)
+            coin = services.symbol_to_coin(sym)
+            text = (
+                f"💥 *Крупные ликвидации за час*\n\n"
+                f"*{coin}*: `{services.fmt_volume(total_usd)}` за последние "
+                f"{config.LIQ_LOOKBACK_MINUTES} мин\n\n"
+                f"_Возможна повышенная волатильность._"
+            )
+            for uid in users:
+                try:
+                    await bot.send_message(uid, text)
+                except Exception as ex:
+                    log.warning("Failed to send liq alert to %s: %s", uid, ex)
+        log.info("Liq monitor job: %s symbols above threshold", len(totals))
+    except Exception as e:
+        log.exception("Liq monitor job error: %s", e)
+
+
 async def setup_scheduler() -> AsyncIOScheduler:
     global _scheduler
     sched = AsyncIOScheduler(timezone=config.TZ)
@@ -979,6 +1126,18 @@ async def setup_scheduler() -> AsyncIOScheduler:
         id="news",
         replace_existing=True,
     )
+    sched.add_job(
+        econ_calendar_job,
+        IntervalTrigger(minutes=10),
+        id="econ_calendar",
+        replace_existing=True,
+    )
+    sched.add_job(
+        liq_monitor_job,
+        IntervalTrigger(minutes=5),
+        id="liq_monitor",
+        replace_existing=True,
+    )
     return sched
 
 
@@ -989,7 +1148,8 @@ async def cmd_settime(m: types.Message, command: CommandObject) -> None:
     """Показать текущее время или изменить: /settime HH:MM"""
     current = await db.get_setting("morning_time") or config.MORNING_TIME
     if not command.args:
-        await m.answer(
+        await _send_or_edit(
+            m,
             f"⏰ *Текущее время утренней сводки:* `{current}` MSK\n\n"
             "Изменить: `/settime HH:MM` (например `/settime 08:30`)\n"
             "Или нажми кнопку ниже:",
@@ -1004,7 +1164,8 @@ async def cmd_settime(m: types.Message, command: CommandObject) -> None:
         if not (0 <= hh < 24 and 0 <= mm < 60):
             raise ValueError
     except ValueError:
-        await m.answer(
+        await _send_or_edit(
+            m,
             "❌ Неверный формат. Используй HH:MM, например `/settime 08:30`",
             reply_markup=kb_settime(current),
         )
@@ -1024,7 +1185,8 @@ async def cmd_settime(m: types.Message, command: CommandObject) -> None:
             log.info("Morning job rescheduled to %s", new_time)
         except Exception as e:
             log.warning("reschedule failed: %s", e)
-    await m.answer(
+    await _send_or_edit(
+        m,
         f"✅ Утренняя сводка теперь в *{new_time}* MSK.\n"
         f"_Изменения применены сразу, без рестарта._",
         reply_markup=kb_market(),
@@ -1053,7 +1215,8 @@ async def cb_settime(c: types.CallbackQuery) -> None:
         except Exception as e:
             log.warning("reschedule failed: %s", e)
     await c.answer(f"✅ Утренняя сводка теперь в {hh:02d}:{mm:02d} MSK")
-    await c.message.edit_text(
+    await _send_or_edit(
+        c,
         f"✅ Утренняя сводка теперь в *{hh:02d}:{mm:02d}* MSK.\n"
         f"_Изменения применены сразу._"
     )
@@ -1089,16 +1252,17 @@ async def cb_news_coin(c: types.CallbackQuery, state: FSMContext) -> None:
     coin = c.data.split(":", 1)[1].upper()
     if coin == "CUSTOM":
         await state.set_state(NewsCustomCoin.waiting_coin)
-        await c.message.answer(
+        await _send_or_edit(
+            c,
             "✏️ *Введи тикер монеты* (например `BTC`, `ETH`, `SOL`):",
             reply_markup=cancel_kb(),
         )
         return
     # ALL — все новости без фильтра
     if coin == "ALL":
-        await _show_news(c.message, [])
+        await _show_news(c, [])
         return
-    await _show_news(c.message, [coin])
+    await _show_news(c, [coin])
 
 
 @router.message(NewsCustomCoin.waiting_coin)
@@ -1119,7 +1283,8 @@ async def cb_sub_coin(c: types.CallbackQuery, state: FSMContext) -> None:
     if coin == "CUSTOM":
         await state.set_state(SubCustomCoin.waiting_coin)
         await c.answer()
-        await c.message.answer(
+        await _send_or_edit(
+            c,
             "✏️ *Введи тикер монеты* для подписки:",
             reply_markup=cancel_kb(),
         )
@@ -1127,7 +1292,8 @@ async def cb_sub_coin(c: types.CallbackQuery, state: FSMContext) -> None:
     added = await db.add_subs(c.from_user.id, [coin])
     subs = await db.get_user_subs(c.from_user.id)
     await c.answer(f"✅ Подписка на {coin}")
-    await c.message.edit_text(
+    await _send_or_edit(
+        c,
         f"✅ Подписка на *{coin}* активна.\n"
         f"Всего подписок: {len(subs)}.",
         reply_markup=kb_subs_current(subs),
@@ -1157,7 +1323,8 @@ async def cb_unsub_coin(c: types.CallbackQuery) -> None:
     await db.remove_subs(c.from_user.id, [coin])
     subs = await db.get_user_subs(c.from_user.id)
     await c.answer(f"🗑 Отписался от {coin}")
-    await c.message.edit_text(
+    await _send_or_edit(
+        c,
         f"🗑 Отписался от *{coin}*.\nОсталось подписок: {len(subs)}",
         reply_markup=kb_subs_current(subs),
     )
@@ -1181,12 +1348,14 @@ async def cb_alert_delete(c: types.CallbackQuery) -> None:
                 lines.append(
                     f"{arrow} *#{a['id']}* `{coin}` {a['direction']} {a['price']:g} — {status}"
                 )
-            await c.message.edit_text(
+            await _send_or_edit(
+                c,
                 "\n".join(lines),
                 reply_markup=kb_alerts_list(alerts),
             )
         else:
-            await c.message.edit_text(
+            await _send_or_edit(
+                c,
                 "🚨 *Алерты*\n\nУ тебя больше нет алертов.",
                 reply_markup=kb_alerts_list([]),
             )
@@ -1215,7 +1384,8 @@ class RiskCalc(StatesGroup):
 
 @router.message(Command("calc"))
 async def cmd_calc(m: types.Message) -> None:
-    await m.answer(
+    await _send_or_edit(
+        m,
         "📊 *Калькулятор позиции (Risk Management)*\n\n"
         "Задай риск → получи размер позиции автоматически.\n\n"
         "Выбери сторону:",
@@ -1230,7 +1400,8 @@ async def cb_calc_side(c: types.CallbackQuery, state: FSMContext) -> None:
     await state.update_data(side=side)
     await c.answer()
     arrow = "🟢 Лонг" if side == "long" else "🔴 Шорт"
-    await c.message.answer(
+    await _send_or_edit(
+        c,
         f"📊 Калькулятор: *{arrow}*\n\n"
         "Введи *размер депозита в USD*:\n"
         "_(сколько у тебя всего на бирже)_",
@@ -1452,7 +1623,6 @@ async def risk_fee(m: types.Message, state: FSMContext) -> None:
         f"_Расчёт приблизительный. Реальная комиссия и ликвидация зависят от биржи._"
     )
 
-    from keyboards import kb_market
     await m.answer(msg, reply_markup=kb_market())
 
 

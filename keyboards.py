@@ -10,6 +10,10 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📊 Калькулятор позиции", callback_data="cmd:calc"),
         ],
         [
+            InlineKeyboardButton(text="📅 Календарь", callback_data="cmd:calendar"),
+            InlineKeyboardButton(text="💥 Ликвидации", callback_data="cmd:liq"),
+        ],
+        [
             InlineKeyboardButton(text="📰 Новости", callback_data="cmd:news"),
             InlineKeyboardButton(text="💰 Цена", callback_data="cmd:price"),
         ],
@@ -154,6 +158,26 @@ def kb_subs_current(coins: list[str]) -> InlineKeyboardMarkup:
     ])
     rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="cmd:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ─────────────────────────── /calendar ───────────────────────────
+def kb_calendar() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔄 Обновить", callback_data="cmd:calendar"),
+        ],
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="cmd:menu")],
+    ])
+
+
+# ─────────────────────────── /liq ────────────────────────────────
+def kb_liq() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔄 Обновить", callback_data="cmd:liq"),
+        ],
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="cmd:menu")],
+    ])
 
 
 # ─────────────────────────── /settime ────────────────────────────
