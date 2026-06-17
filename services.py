@@ -832,7 +832,15 @@ async def fetch_all_force_orders(
         params,
     )
     if not data or not isinstance(data, list):
-        return []
+        # allForceOrders часто отдаёт 400/403, fallback на forceOrders по символам
+        all_orders: list[dict] = []
+        for sym in config.LIQ_SYMBOLS:
+            orders = await fetch_force_orders(
+                session, symbol=sym, start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms, limit=limit,
+            )
+            all_orders.extend(orders)
+        return all_orders
     return data
 
 
