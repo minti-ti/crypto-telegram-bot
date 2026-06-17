@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import re
@@ -612,33 +613,32 @@ async def fetch_mql5_calendar(
         log.warning("MQL5 calendar error: %s", e)
         return []
 
-    # Ищем строки вида: 2026.06.15 12:30, USD, Event Name, Actual: x, Forecast: y, Previous: z
-    lines = text.splitlines()
+    # MQL5 рендерит события в div'ах вида:
+    # <div class="ec-table__item ec-table__item_inline">2026.06.17 18:00, USD, <a href="...">FOMC Statement</a></div>
     events: list[dict] = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        m = re.match(
-            r"(\d{4}\.\d{2}\.\d{2})\s+(\d{2}:\d{2}),\s+([A-Z]{3}),\s+(.*)",
-            line,
-        )
-        if not m:
-            continue
+    pattern = re.compile(
+        r'<div class="ec-table__item ec-table__item_inline">'
+        r'(\d{4}\.\d{2}\.\d{2})\s+(\d{2}:\d{2}),\s+([A-Z]{3}),\s+(.*?)</div>',
+        re.S,
+    )
+    for m in pattern.finditer(text):
         date_str, time_str, currency, rest = m.groups()
+        # Извлекаем название события из ссылки
+        name_match = re.search(r'<a[^>]*>(.*?)</a>', rest)
+        event_name = name_match.group(1) if name_match else rest
+        # Убираем HTML-теги
+        event_name = html.unescape(re.sub(r'<[^>]+>', '', event_name)).strip()
+
         # Парсим Actual/Forecast/Previous из rest
-        event_name = rest
         actual = estimate = previous = ""
         for label in ("Actual:", "Forecast:", "Previous:"):
             if label in rest:
                 idx = rest.index(label)
                 part = rest[idx:]
-                # значение до следующей запятой или конца
                 val_end = part.find(",", len(label))
                 if val_end == -1:
                     val_end = len(part)
                 val = part[len(label):val_end].strip()
-                event_name = rest[:idx].rstrip(", ")
                 if label == "Actual:":
                     actual = val
                 elif label == "Forecast:":
@@ -657,7 +657,7 @@ async def fetch_mql5_calendar(
             "date": iso_date,
             "time": time_str,
             "country": currency,
-            "event": event_name.strip(),
+            "event": event_name,
             "actual": actual or None,
             "estimate": estimate or None,
             "previous": previous or None,
@@ -666,6 +666,7 @@ async def fetch_mql5_calendar(
 
     # Фильтруем по датам
     out = [e for e in events if from_date <= e["date"] <= to_date]
+    log.info("MQL5 calendar: parsed %s events, filtered %s", len(events), len(out))
     return out
 
 
@@ -703,7 +704,7 @@ def _filter_us_macro_events(events: list[dict]) -> list[dict]:
 
 
 def _parse_event_datetime(e: dict) -> datetime | None:
-    """Парсим date + time в datetime UTC. Finnhub возвращает ET (UTC-4/UTC-5)."""
+    """Парсим date + time в datetime UTC. MQL5 возвращает UTC."""
     date_s = e.get("date") or ""
     time_s = e.get("time") or ""
     if not date_s:
@@ -718,9 +719,6 @@ def _parse_event_datetime(e: dict) -> datetime | None:
             dt = dt.replace(hour=hh, minute=mm)
         except Exception:
             pass
-    # Приводим ET → UTC. Летом (EDT) UTC-4, зимой (EST) UTC-5.
-    # Для алертов ±1 час не критично, используем +4.
-    dt = dt + timedelta(hours=4)
     return dt.replace(tzinfo=timezone.utc)
 
 
@@ -736,7 +734,7 @@ def _fmt_event(e: dict) -> str:
     previous = e.get("previous")
     impact = (e.get("impact") or "").lower()
     emoji = "🔥" if impact == "3" or impact == "high" else "⚡" if impact == "2" or impact == "medium" else "•"
-    parts = [f"{emoji} *{event}* — `{time_s} ET`"]
+    parts = [f"{emoji} *{event}* — `{time_s} UTC`"]
     vals = []
     if estimate is not None:
         vals.append(f"прогноз `{estimate}`")
@@ -759,7 +757,7 @@ async def build_econ_calendar_text(days: int = 1) -> str:
     events = _filter_us_macro_events(events)
     if not events:
         return "📅 *Экономический календарь*\n\nНет важных US-событий на ближайшие дни."
-    lines = [f"📅 *Экономический календарь (US)*\n_Время ET (UTC-4/UTC-5)_\n"]
+    lines = [f"📅 *Экономический календарь (US)*\n_Время UTC_\n"]
     for e in events[:20]:
         lines.append(_fmt_event(e))
     return "\n\n".join(lines)
