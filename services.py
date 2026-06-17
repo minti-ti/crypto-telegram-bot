@@ -88,7 +88,7 @@ async def get_24h_tickers(
     session: aiohttp.ClientSession, symbols: list[str]
 ) -> dict[str, dict]:
     data = await _get_json(
-        session, "https://api.binance.com/api/v3/ticker/24hr"
+        session, "https://fapi.binance.com/fapi/v1/ticker/24hr"
     )
     if not data:
         return {}
@@ -105,7 +105,7 @@ async def get_price(
 ) -> float | None:
     data = await _get_json(
         session,
-        "https://api.binance.com/api/v3/ticker/price",
+        "https://fapi.binance.com/fapi/v1/ticker/price",
         {"symbol": symbol.upper()},
     )
     if data and "price" in data:
@@ -596,17 +596,30 @@ def _filter_us_macro_events(events: list[dict]) -> list[dict]:
         if country not in ("US", "UNITED STATES", "USA"):
             continue
         event_name = (e.get("event") or "").upper()
-        impact = (e.get("impact") or "").lower()
-        if not any(kw in event_name for kw in US_ECON_KEYWORDS):
-            continue
-        if impact not in ("high", "medium") and not any(kw in event_name for kw in ("CPI", "NFP", "FOMC", "GDP", "PPI")):
-            continue
+
+        # impact у Finnhub — строка "1" / "2" / "3" (1=low, 2=medium, 3=high)
+        impact_raw = e.get("impact")
+        impact_val = 0
+        if isinstance(impact_raw, (int, float)):
+            impact_val = int(impact_raw)
+        elif isinstance(impact_raw, str):
+            impact_raw = impact_raw.strip().lower()
+            if impact_raw.isdigit():
+                impact_val = int(impact_raw)
+            else:
+                impact_val = {"low": 1, "medium": 2, "high": 3}.get(impact_raw, 0)
+
+        # ECON_MIN_IMPORTANCE по умолчанию 3 (high). Если хочешь medium — ставь 2 в .env
+        if impact_val < config.ECON_MIN_IMPORTANCE:
+            # но всё равно пропускаем, если это не явно важное ключевое слово
+            if not any(kw in event_name for kw in ("CPI", "NFP", "FOMC", "GDP", "PPI")):
+                continue
         out.append(e)
     return out
 
 
 def _parse_event_datetime(e: dict) -> datetime | None:
-    """Парсим date + time в datetime UTC."""
+    """Парсим date + time в datetime UTC. Finnhub возвращает ET (UTC-4/UTC-5)."""
     date_s = e.get("date") or ""
     time_s = e.get("time") or ""
     if not date_s:
@@ -621,8 +634,9 @@ def _parse_event_datetime(e: dict) -> datetime | None:
             dt = dt.replace(hour=hh, minute=mm)
         except Exception:
             pass
-    # Finnhub economic calendar — обычно время в EST (UTC-5/UTC-4).
-    # Для простоты считаем UTC, но при отображении пишем "EST".
+    # Приводим ET → UTC. Летом (EDT) UTC-4, зимой (EST) UTC-5.
+    # Для алертов ±1 час не критично, используем +4.
+    dt = dt + timedelta(hours=4)
     return dt.replace(tzinfo=timezone.utc)
 
 
@@ -637,8 +651,8 @@ def _fmt_event(e: dict) -> str:
     estimate = e.get("estimate")
     previous = e.get("previous")
     impact = (e.get("impact") or "").lower()
-    emoji = "🔥" if impact == "high" else "⚡" if impact == "medium" else "•"
-    parts = [f"{emoji} *{event}* — `{time_s} EST`"]
+    emoji = "🔥" if impact == "3" or impact == "high" else "⚡" if impact == "2" or impact == "medium" else "•"
+    parts = [f"{emoji} *{event}* — `{time_s} ET`"]
     vals = []
     if estimate is not None:
         vals.append(f"прогноз `{estimate}`")
@@ -661,7 +675,7 @@ async def build_econ_calendar_text(days: int = 1) -> str:
     events = _filter_us_macro_events(events)
     if not events:
         return "📅 *Экономический календарь*\n\nНет важных US-событий на ближайшие дни."
-    lines = [f"📅 *Экономический календарь (US)*\n_Время EST / UTC-5(4)_\n"]
+    lines = [f"📅 *Экономический календарь (US)*\n_Время ET (UTC-4/UTC-5)_\n"]
     for e in events[:20]:
         lines.append(_fmt_event(e))
     return "\n\n".join(lines)
@@ -764,26 +778,76 @@ def aggregate_liquidations(
     return totals
 
 
-async def build_liquidations_text(window_minutes: int = 60) -> str:
-    """Текст с текущими ликвидациями за window_minutes."""
+def aggregate_liquidations_by_bucket(
+    orders: list[dict],
+    symbols: list[str],
+    bucket_hours: int = 6,
+    total_hours: int = 24,
+) -> tuple[dict[tuple[str, int], float], dict[str, float]]:
+    """Группировка ликвидаций по bucket_hours-часовым интервалам."""
     now_ms = int(time.time() * 1000)
-    start_ms = now_ms - window_minutes * 60 * 1000
+    cutoff_ms = now_ms - total_hours * 3600 * 1000
+    wanted = {s.upper() for s in symbols}
+    bucket_ms = bucket_hours * 3600 * 1000
+    buckets: dict[tuple[str, int], float] = {}
+    totals: dict[str, float] = {}
+    for o in orders:
+        sym = (o.get("symbol") or "").upper()
+        if wanted and sym not in wanted:
+            continue
+        ts = o.get("time") or 0
+        if ts < cutoff_ms or ts > now_ms:
+            continue
+        try:
+            price = float(o.get("price", 0))
+            qty = float(o.get("executedQty", 0))
+        except (TypeError, ValueError):
+            continue
+        if price <= 0 or qty <= 0:
+            continue
+        val = price * qty
+        bucket_idx = int((now_ms - ts) // bucket_ms)
+        key = (sym, bucket_idx)
+        buckets[key] = buckets.get(key, 0.0) + val
+        totals[sym] = totals.get(sym, 0.0) + val
+    return buckets, totals
+
+
+async def build_liquidations_text(hours: int = 24) -> str:
+    """Текст с ликвидациями за последние hours часов с разбивкой по интервалам."""
+    now_ms = int(time.time() * 1000)
+    bucket_hours = 6
+    all_orders: list[dict] = []
     async with _shared_session() as s:
-        orders = await fetch_all_force_orders(s, start_time_ms=start_ms, end_time_ms=now_ms, limit=1000)
-    totals = aggregate_liquidations(orders, config.LIQ_SYMBOLS, window_minutes=window_minutes)
+        # Разбиваем на 6-часовые интервалы, чтобы не терять данные из-за limit=1000
+        for i in range(hours // bucket_hours):
+            end_ms = now_ms - i * bucket_hours * 3600 * 1000
+            start_ms = end_ms - bucket_hours * 3600 * 1000
+            orders = await fetch_all_force_orders(
+                s, start_time_ms=start_ms, end_time_ms=end_ms, limit=1000
+            )
+            all_orders.extend(orders)
+    buckets, totals = aggregate_liquidations_by_bucket(
+        all_orders, config.LIQ_SYMBOLS, bucket_hours=bucket_hours, total_hours=hours
+    )
     if not totals:
         return (
-            f"💥 *Ликвидации за {window_minutes} мин*\n\n"
-            f"Нет крупных ликвидаций по `{', '.join(config.LIQ_SYMBOLS)}`."
+            f"💥 *Ликвидации за {hours}ч*\n\n"
+            f"Нет данных по `{', '.join(config.LIQ_SYMBOLS)}`."
         )
-    lines = [f"💥 *Ликвидации за {window_minutes} мин*\n"]
+    labels = ["0-6ч", "6-12ч", "12-18ч", "18-24ч"]
+    lines = [f"💥 *Ликвидации за {hours}ч*\n"]
     total_all = 0.0
     for sym in sorted(totals, key=totals.get, reverse=True):
         val = totals[sym]
         total_all += val
         coin = symbol_to_coin(sym)
-        lines.append(f"• *{coin}*: `{fmt_volume(val)}`")
-    lines.append(f"\n_Всего: {fmt_volume(total_all)}_")
+        lines.append(f"*{coin}* — всего `{fmt_volume(val)}`")
+        for idx, label in enumerate(labels):
+            bucket_val = buckets.get((sym, idx), 0.0)
+            lines.append(f"  {label}: `{fmt_volume(bucket_val)}`")
+        lines.append("")
+    lines.append(f"_Всего: {fmt_volume(total_all)}_")
     return "\n".join(lines)
 
 
