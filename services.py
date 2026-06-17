@@ -613,6 +613,8 @@ async def fetch_mql5_calendar(
         log.warning("MQL5 calendar error: %s", e)
         return []
 
+    log.info("MQL5 calendar: fetched HTML length %s", len(text))
+
     # MQL5 рендерит события в div'ах вида:
     # <div class="ec-table__item ec-table__item_inline">2026.06.17 18:00, USD, <a href="...">FOMC Statement</a></div>
     events: list[dict] = []
@@ -754,7 +756,9 @@ async def build_econ_calendar_text(days: int = 1) -> str:
     to_date = (today + timedelta(days=days)).strftime("%Y-%m-%d")
     async with _shared_session() as s:
         events = await fetch_economic_calendar(s, from_date, to_date)
+    log.info("Calendar: raw events %s, filtered US events %s", len(events), 0)
     events = _filter_us_macro_events(events)
+    log.info("Calendar: filtered US events %s", len(events))
     if not events:
         return "📅 *Экономический календарь*\n\nНет важных US-событий на ближайшие дни."
     lines = [f"📅 *Экономический календарь (US)*\n_Время UTC_\n"]
