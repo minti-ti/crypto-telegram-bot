@@ -691,7 +691,7 @@ async def alert_price(m: types.Message, state: FSMContext) -> None:
 
 @router.message(Command("alerts"))
 async def cmd_alerts(m: types.Message) -> None:
-    rows = db.list_user_alerts(m.from_user.id)
+    rows = await db.list_user_alerts(m.from_user.id)
     if not rows:
         await m.answer("У тебя нет алертов. Создай: `/alert BTCUSDT above 70000`",
                        reply_markup=kb_alerts())
@@ -748,7 +748,7 @@ async def cmd_unsubscribe(m: types.Message, command: CommandObject) -> None:
 
 @router.message(Command("mysubs"))
 async def cmd_mysubs(m: types.Message) -> None:
-    subs = db.get_user_subs(m.from_user.id)
+    subs = await db.get_user_subs(m.from_user.id)
     if not subs:
         await m.answer("Нет подписок. Добавь: `/subscribe BTC,ETH`",
                        reply_markup=kb_news())
