@@ -1,6 +1,7 @@
 """Тест MQL5 economic calendar."""
 import asyncio
 import aiohttp
+import re
 from datetime import datetime, timezone, timedelta
 
 
@@ -16,23 +17,31 @@ async def main():
             print(f"Status: {r.status}")
             text = await r.text()
 
+    print(f"HTML length: {len(text)}")
+
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     to_date = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%d")
     print(f"\nLooking for dates between {today} and {to_date}")
 
-    # Показываем строки, похожие на события
-    import re
-    lines = text.splitlines()
-    found = 0
-    for line in lines:
-        line = line.strip()
-        if re.match(r"\d{4}\.\d{2}\.\d{2}\s+\d{2}:\d{2},\s+[A-Z]{3},", line):
-            print(line)
-            found += 1
-            if found > 30:
-                break
+    pattern = re.compile(
+        r'<div class="ec-table__item ec-table__item_inline">'
+        r'(\d{4}\.\d{2}\.\d{2})\s+(\d{2}:\d{2}),\s+([A-Z]{3}),\s+(.*?)</div>',
+        re.S,
+    )
+    matches = list(pattern.finditer(text))
+    print(f"Total event matches found: {len(matches)}")
 
-    print(f"\nTotal event-like lines found: {found}")
+    us_count = 0
+    for m in matches[:30]:
+        date_str, time_str, currency, rest = m.groups()
+        name_match = re.search(r'<a[^>]*>(.*?)</a>', rest)
+        event_name = name_match.group(1) if name_match else rest
+        event_name = re.sub(r'<[^>]+>', '', event_name).strip()
+        if currency == "USD" and today <= date_str.replace(".", "-") <= to_date:
+            us_count += 1
+            print(f"{date_str} {time_str} {currency} {event_name}")
+
+    print(f"\nUS events in window: {us_count}")
 
 
 if __name__ == "__main__":

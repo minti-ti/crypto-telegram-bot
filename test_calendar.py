@@ -1,10 +1,12 @@
-"""Тест Finnhub economic calendar."""
+"""Тест экономического календаря."""
 import asyncio
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timezone, timedelta
 import aiohttp
-from dotenv import load_dotenv
 
-load_dotenv()
+# Заглушки для config
+os.environ.setdefault("BOT_TOKEN", "123456:ABC")
+os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost/db")
 
 import config
 import services
@@ -13,10 +15,9 @@ import services
 async def main():
     print(f"FINNHUB_API_KEY: {config.FINNHUB_API_KEY[:10]}..." if config.FINNHUB_API_KEY else "FINNHUB_API_KEY: NOT SET")
     print(f"ECON_MIN_IMPORTANCE: {config.ECON_MIN_IMPORTANCE}")
-    print(f"ECON_COUNTRIES: {config.ECON_COUNTRIES}")
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    to_date = (datetime.now(timezone.utc) + __import__("datetime").timedelta(days=2)).strftime("%Y-%m-%d")
+    to_date = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%d")
     print(f"\nRequest: {today} -> {to_date}")
 
     async with services._shared_session() as s:
@@ -28,7 +29,7 @@ async def main():
         for e in raw[:5]:
             print(e)
     else:
-        print("No raw events. Check API key / region / limits.")
+        print("No raw events.")
         return
 
     filtered = services._filter_us_macro_events(raw)
