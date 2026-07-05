@@ -260,13 +260,9 @@ async def _send_price(target: types.Message | types.CallbackQuery, symbol: str) 
     if not sym.endswith("USDT") and sym not in ("BTCUSDT", "ETHUSDT"):
         sym = sym + "USDT"
     async with services._shared_session() as s:
-        ticker = await services._get_json(
-            s,
-            f"{services.BINANCE_SPOT}/ticker/24hr",
-            {"symbol": sym},
-        )
+        ticker = await services.get_market_ticker(s, sym)
     if not ticker:
-        await _send_or_edit(target, f"❌ Не нашёл `{sym}` на Binance. Проверь тикер.")
+        await _send_or_edit(target, f"❌ Не нашёл `{sym}` в источниках данных OKX/CoinGecko. Проверь тикер.")
         return
     try:
         price = float(ticker["lastPrice"])
@@ -537,11 +533,9 @@ async def cmd_oi(m: types.Message, command: CommandObject) -> None:
 # ─────────────────────────── /top ───────────────────────────────
 async def _send_top(target: types.Message | types.CallbackQuery) -> None:
     async with services._shared_session() as s:
-        data = await services._get_json(
-            s, f"{services.BINANCE_SPOT}/ticker/24hr"
-        )
+        data = await services.get_all_market_tickers(s)
     if not data:
-        await _send_or_edit(target, "⚠️ Не удалось получить данные.", reply_markup=kb_market())
+        await _send_or_edit(target, "⚠️ Не удалось получить данные из OKX/CoinGecko.", reply_markup=kb_market())
         return
     # фильтруем USDT-пары с достаточным объёмом
     rows = []

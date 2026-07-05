@@ -37,8 +37,11 @@ log = logging.getLogger(__name__)
 TIMEOUT = aiohttp.ClientTimeout(total=20)
 HEADERS = {"User-Agent": "crypto-tg-bot/1.0"}
 
-# Binance spot (EU-safe mirror)
+# Market data providers. Binance endpoints are often blocked/restricted in Europe,
+# so OKX public market data is the primary source; Binance mirror is fallback only.
 BINANCE_SPOT = "https://data-api.binance.vision/api/v3"
+OKX_MARKET = "https://www.okx.com/api/v5/market"
+OKX_PUBLIC = "https://www.okx.com/api/v5/public"
 
 
 # ─────────────────────────── утилиты ───────────────────────────
@@ -97,36 +100,161 @@ def fear_greed_emoji(value: int) -> str:
     return "🤑 Extreme Greed"
 
 
-# ─────────────────────────── Binance Spot: цены ─────────────────
+# ─────────────────────────── Market data: OKX primary + fallbacks ─────────────
+def _norm_symbol(symbol: str) -> str:
+    s = symbol.upper().replace("/", "").replace("-", "")
+    if not s.endswith("USDT") and s not in ("USDT", "USD", "EUR", "RUB"):
+        s += "USDT"
+    return s
+
+
+def _okx_inst_id(symbol: str) -> str:
+    coin = symbol_to_coin(_norm_symbol(symbol))
+    return f"{coin}-USDT-SWAP"
+
+
+def _okx_inst_to_symbol(inst_id: str) -> str:
+    # BTC-USDT-SWAP -> BTCUSDT
+    parts = inst_id.upper().split("-")
+    if len(parts) >= 2:
+        return f"{parts[0]}{parts[1]}"
+    return inst_id.replace("-", "")
+
+
+def _unify_okx_ticker(t: dict) -> dict | None:
+    try:
+        last = float(t.get("last") or 0)
+        open24h = float(t.get("open24h") or 0)
+        high = float(t.get("high24h") or 0)
+        low = float(t.get("low24h") or 0)
+        # OKX volCcy24h for USDT swaps is base-coin volume. Convert to USD.
+        vol_base = float(t.get("volCcy24h") or t.get("vol24h") or 0)
+        quote_vol = vol_base * last if vol_base and last else 0.0
+        ch = ((last - open24h) / open24h * 100) if open24h else 0.0
+        symbol = _okx_inst_to_symbol(t.get("instId", ""))
+        return {
+            "symbol": symbol,
+            "lastPrice": str(last),
+            "priceChangePercent": str(ch),
+            "highPrice": str(high),
+            "lowPrice": str(low),
+            "quoteVolume": str(quote_vol),
+            "source": "OKX",
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+async def get_market_ticker(session: aiohttp.ClientSession, symbol: str) -> dict | None:
+    """24h ticker. Primary source: OKX public API (works in EU better than Binance)."""
+    sym = _norm_symbol(symbol)
+
+    # 1) OKX USDT perpetual swap
+    data = await _get_json(session, f"{OKX_MARKET}/ticker", {"instId": _okx_inst_id(sym)})
+    if data and data.get("code") == "0" and data.get("data"):
+        t = _unify_okx_ticker(data["data"][0])
+        if t:
+            t["symbol"] = sym
+            return t
+
+    # 2) Binance mirror fallback (spot, no key)
+    data = await _get_json(session, f"{BINANCE_SPOT}/ticker/24hr", {"symbol": sym})
+    if data and isinstance(data, dict) and data.get("lastPrice"):
+        data["source"] = "Binance mirror"
+        return data
+
+    # 3) CoinGecko simple fallback for popular coins
+    cg_id = _COINGECKO_IDS.get(symbol_to_coin(sym))
+    if cg_id:
+        data = await _get_json(
+            session,
+            "https://api.coingecko.com/api/v3/simple/price",
+            {"ids": cg_id, "vs_currencies": "usd", "include_24hr_change": "true"},
+        )
+        row = data.get(cg_id) if isinstance(data, dict) else None
+        if row and row.get("usd") is not None:
+            price = float(row["usd"])
+            return {
+                "symbol": sym,
+                "lastPrice": str(price),
+                "priceChangePercent": str(float(row.get("usd_24h_change") or 0)),
+                "highPrice": str(price),
+                "lowPrice": str(price),
+                "quoteVolume": "0",
+                "source": "CoinGecko",
+            }
+    return None
+
+
+async def get_all_market_tickers(session: aiohttp.ClientSession) -> list[dict]:
+    """All USDT tickers for /top. Primary OKX SWAP, fallback Binance mirror."""
+    data = await _get_json(session, f"{OKX_MARKET}/tickers", {"instType": "SWAP"})
+    rows: list[dict] = []
+    if data and data.get("code") == "0" and isinstance(data.get("data"), list):
+        for t in data["data"]:
+            inst = t.get("instId", "")
+            if not inst.endswith("-USDT-SWAP"):
+                continue
+            u = _unify_okx_ticker(t)
+            if u:
+                rows.append(u)
+        if rows:
+            return rows
+
+    data = await _get_json(session, f"{BINANCE_SPOT}/ticker/24hr")
+    if data and isinstance(data, list):
+        for t in data:
+            if str(t.get("symbol", "")).endswith("USDT"):
+                t["source"] = "Binance mirror"
+                rows.append(t)
+    return rows
+
+
 async def get_24h_tickers(
     session: aiohttp.ClientSession, symbols: list[str]
 ) -> dict[str, dict]:
-    """Все 24ч тикеры со spot (data-api.binance.vision)."""
-    data = await _get_json(session, f"{BINANCE_SPOT}/ticker/24hr")
-    if not data:
-        return {}
-    wanted = {s.upper() for s in symbols}
-    return {
-        t["symbol"]: t
-        for t in data
-        if t["symbol"] in wanted
-    }
+    """24ч тикеры для списка символов через OKX/Binance/CoinGecko fallbacks."""
+    results = await asyncio.gather(
+        *[get_market_ticker(session, s) for s in symbols],
+        return_exceptions=True,
+    )
+    out: dict[str, dict] = {}
+    for sym, r in zip(symbols, results):
+        if isinstance(r, dict):
+            out[_norm_symbol(sym)] = r
+    return out
 
 
 async def get_price(
     session: aiohttp.ClientSession, symbol: str
 ) -> float | None:
-    data = await _get_json(
-        session,
-        f"{BINANCE_SPOT}/ticker/price",
-        {"symbol": symbol.upper()},
-    )
-    if data and "price" in data:
+    ticker = await get_market_ticker(session, symbol)
+    if ticker and ticker.get("lastPrice") is not None:
         try:
-            return float(data["price"])
+            return float(ticker["lastPrice"])
         except (TypeError, ValueError):
             return None
     return None
+
+
+_COINGECKO_IDS = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "BNB": "binancecoin",
+    "SOL": "solana",
+    "XRP": "ripple",
+    "TON": "the-open-network",
+    "ADA": "cardano",
+    "DOGE": "dogecoin",
+    "TRX": "tron",
+    "LINK": "chainlink",
+    "AVAX": "avalanche-2",
+    "DOT": "polkadot",
+    "MATIC": "matic-network",
+    "SUI": "sui",
+    "LTC": "litecoin",
+    "BCH": "bitcoin-cash",
+}
 
 
 # ─────────────────────────── CoinGecko derivatives ──────────────
@@ -159,8 +287,30 @@ async def _get_coingecko_derivatives(session: aiohttp.ClientSession) -> list[dic
 async def get_funding_rate(
     session: aiohttp.ClientSession, symbol: str
 ) -> dict | None:
-    """Funding rate через CoinGecko derivatives (Binance Futures)."""
-    coin = symbol_to_coin(symbol).upper()
+    """Funding rate: OKX public API primary, CoinGecko fallback."""
+    sym_norm = _norm_symbol(symbol)
+    coin = symbol_to_coin(sym_norm).upper()
+
+    # OKX funding endpoint is public and works without Binance access.
+    okx_funding = await _get_json(
+        session,
+        f"{OKX_PUBLIC}/funding-rate",
+        {"instId": _okx_inst_id(sym_norm)},
+    )
+    if okx_funding and okx_funding.get("code") == "0" and okx_funding.get("data"):
+        try:
+            row = okx_funding["data"][0]
+            ticker = await get_market_ticker(session, sym_norm)
+            mark_price = float(ticker["lastPrice"]) if ticker else 0.0
+            return {
+                "symbol": sym_norm,
+                "markPrice": mark_price,
+                "indexPrice": mark_price,
+                "lastFundingRate": float(row.get("fundingRate") or 0),
+                "nextFundingTime": int(row.get("nextFundingTime") or row.get("fundingTime") or 0),
+            }
+        except (TypeError, ValueError, KeyError):
+            pass
     derivs = await _get_coingecko_derivatives(session)
     if not derivs:
         return None
@@ -254,8 +404,32 @@ async def get_funding_rate(
 async def get_open_interest(
     session: aiohttp.ClientSession, symbol: str
 ) -> dict | None:
-    """Open Interest через CoinGecko derivatives (в USD)."""
-    coin = symbol_to_coin(symbol).upper()
+    """Open Interest: OKX public API primary, CoinGecko fallback."""
+    sym_norm = _norm_symbol(symbol)
+    coin = symbol_to_coin(sym_norm).upper()
+
+    okx_oi = await _get_json(
+        session,
+        f"{OKX_PUBLIC}/open-interest",
+        {"instType": "SWAP", "instId": _okx_inst_id(sym_norm)},
+    )
+    if okx_oi and okx_oi.get("code") == "0" and okx_oi.get("data"):
+        try:
+            row = okx_oi["data"][0]
+            oi_usd = float(row.get("oiUsd") or 0)
+            oi_coins = float(row.get("oiCcy") or 0)
+            ticker = await get_market_ticker(session, sym_norm)
+            price = float(ticker["lastPrice"]) if ticker else (oi_usd / oi_coins if oi_coins else 0)
+            if oi_usd > 0 or oi_coins > 0:
+                return {
+                    "symbol": sym_norm,
+                    "open_interest": oi_coins,
+                    "open_interest_usd": oi_usd,
+                    "price": price,
+                    "time": int(row.get("ts") or time.time() * 1000),
+                }
+        except (TypeError, ValueError, KeyError):
+            pass
     derivs = await _get_coingecko_derivatives(session)
     if not derivs:
         return None
