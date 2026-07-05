@@ -865,9 +865,9 @@ async def check_news_job() -> None:
 
 
 async def econ_calendar_job() -> None:
-    """Алерт за 60 минут до важных US macro-событий."""
-    if not config.FINNHUB_API_KEY:
-        return
+    """Алерт за 60 минут до high-impact US macro-событий.
+    Работает и без Finnhub: если ключа нет, используется бесплатный MQL5 fallback.
+    """
     try:
         async with services._shared_session() as s:
             events = await services.get_upcoming_macro_events(

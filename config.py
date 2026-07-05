@@ -64,6 +64,12 @@ NEWS_RSS_FEEDS: list[str] = [
 NEWS_LOOKBACK_HOURS: int = int(_get("NEWS_LOOKBACK_HOURS", "12"))
 NEWS_MAX_PER_LLM: int = int(_get("NEWS_MAX_PER_LLM", "30"))
 
+NEWS_ALLOWED_COINS: list[str] = [
+    c.strip().upper()
+    for c in _get("NEWS_ALLOWED_COINS", "BTC,ETH,TON").split(",")
+    if c.strip()
+]
+
 # ---- Параметры ----
 TOP_SYMBOLS: list[str] = [
     s.strip().upper()

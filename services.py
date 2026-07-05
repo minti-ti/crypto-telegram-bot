@@ -645,6 +645,21 @@ NEWS_LLM_SYSTEM = (
 )
 
 
+def _news_target_set(target_coins: list[str] | None = None) -> set[str]:
+    allowed = {c.upper() for c in getattr(config, "NEWS_ALLOWED_COINS", ["BTC", "ETH", "TON"])}
+    requested = {c.upper() for c in (target_coins or []) if c.upper() != "ALL"}
+    if requested:
+        return requested & allowed
+    return allowed
+
+
+def _news_is_allowed(coins: list[str], target_coins: list[str] | None = None) -> bool:
+    target = _news_target_set(target_coins)
+    if not target:
+        return False
+    return bool(set(coins) & target)
+
+
 async def _filter_news_heuristic(
     items: list[dict], target_coins: list[str] | None = None,
 ) -> list[dict]:
@@ -652,7 +667,7 @@ async def _filter_news_heuristic(
     Используется, если OpenRouter не задан/упал/вернул невалидный JSON.
     """
     out: list[dict] = []
-    target_set = {c.upper() for c in (target_coins or [])}
+    target_set = _news_target_set(target_coins)
     candidates: list[tuple[dict, list[str], str, str]] = []
     for it in items[:config.NEWS_MAX_PER_LLM]:
         title = it.get("title", "")
@@ -660,9 +675,11 @@ async def _filter_news_heuristic(
         if not is_important:
             continue
         coins = _extract_coins_from_text(title)
-        # Для конкретной монеты показываем новости по ней + обще-рыночные.
-        if target_set and coins and not (set(coins) & target_set):
+        # Новости оставляем только по BTC/ETH/TON (или пересечению с запросом).
+        # Обще-рыночные без явной привязки к этим монетам отбрасываем.
+        if not (set(coins) & target_set):
             continue
+        coins = sorted(set(coins) & target_set)
         candidates.append((it, coins, importance, reason))
 
     translations = await _translate_titles([it["title"] for it, *_ in candidates])
@@ -753,6 +770,10 @@ async def filter_news_with_llm(
         orig = by_url.get(f["url"])
         if not orig:
             continue
+        coins = [c.upper() for c in f.get("coins", []) if isinstance(c, str)]
+        coins = sorted(set(coins) & _news_target_set(target_coins))
+        if not coins:
+            continue
         title_ru = (f.get("title_ru") or "").strip()
         if not title_ru and _HAS_TRANSLATOR:
             try:
@@ -763,7 +784,7 @@ async def filter_news_with_llm(
                 title_ru = ""
         out.append({
             **orig,
-            "coins": [c.upper() for c in f.get("coins", []) if isinstance(c, str)],
+            "coins": coins,
             "reason": f.get("reason", ""),
             "importance": f.get("importance", "medium"),
             "title_ru": title_ru,
@@ -833,6 +854,8 @@ _CLICKBAIT_OR_LOW_VALUE_KW = (
     "price prediction", "could reach", "will reach", "analyst says",
     "top 3", "best crypto", "to buy", "presale", "sponsored",
     "opinion", "how to", "guide", "what is", "learn",
+    "bollinger", "technical analysis", "chart pattern", "reversal",
+    "rally", "jumps above", "slips below", "bear-market end",
 )
 
 
@@ -958,10 +981,13 @@ US_ECON_KEYWORDS = (
 )
 
 HIGH_IMPACT_KEYWORDS = (
-    "CPI", "NFP", "NONFARM", "FOMC", "FED INTEREST RATE", "GDP", "PPI",
-    "UNEMPLOYMENT RATE", "RETAIL SALES", "CORE RETAIL SALES",
-    "ISM NON-MANUFACTURING", "ISM MANUFACTURING", "S&P GLOBAL SERVICES PMI",
-    "S&P GLOBAL COMPOSITE PMI", "JOLTS", "FED GOVERNOR", "FED CHAIR", "FED SPEECH",
+    # События уровня TradingView High impact — в такие минуты лучше не открывать сделки
+    "CPI", "CORE CPI", "PCE", "CORE PCE", "NFP", "NONFARM", "PAYROLL",
+    "FOMC", "FED INTEREST RATE", "INTEREST RATE DECISION", "FED CHAIR", "POWELL",
+    "FED GOVERNOR", "FED SPEECH", "GDP", "PPI", "CORE PPI",
+    "UNEMPLOYMENT RATE", "JOBLESS CLAIMS", "RETAIL SALES", "CORE RETAIL SALES",
+    "ISM MANUFACTURING PMI", "ISM NON-MANUFACTURING PMI", "ISM SERVICES PMI",
+    "JOLTS", "CONSUMER CONFIDENCE",
 )
 
 
@@ -1193,24 +1219,16 @@ async def build_econ_calendar_text(days: int = 1) -> str:
     events = _filter_us_macro_events(events)
     # Только предстоящие
     events = [e for e in events if _parse_event_datetime(e) and _parse_event_datetime(e) > now]
+    # Только high-impact события (как красные/важные в TradingView): CPI, FOMC, NFP,
+    # PCE, GDP, PPI, Retail Sales, ISM, Powell/Fed и т.п.
+    events = [e for e in events if _is_high_impact_event(e.get("event", ""))]
     if not events:
-        return "📅 *Нет предстоящих US macro-событий на ближайшие дни.*"
+        return "📅 *На ближайшие дни нет high-impact US-событий.*\n\n_Если бот молчит — значит сейчас нет событий, перед которыми лучше не торговать._"
 
-    # Сначала показываем самые важные. Если их нет — показываем ближайшие
-    # средне-важные USD-события, чтобы календарь не выглядел пустым.
-    high_events = [e for e in events if _is_high_impact_event(e.get("event", ""))]
-    title = "📅 *Важные предстоящие US-события (MSK)*\n"
-    if high_events:
-        events = high_events
-    else:
-        title = "📅 *Ближайшие US macro-события (MSK)*\n"
-
-    # Сортировка по времени
     events.sort(key=lambda e: _parse_event_datetime(e) or datetime.min.replace(tzinfo=timezone.utc))
-    # Перевод на русский
     events = await _translate_events(events)
-    lines = [title]
-    for e in events[:12]:
+    lines = ["📅 *High-impact US-события (MSK)*\n_В эти периоды лучше снизить риск или не открывать сделки._"]
+    for e in events[:10]:
         lines.append(_fmt_event(e))
     return "\n\n".join(lines)
 
@@ -1226,6 +1244,8 @@ async def get_upcoming_macro_events(
     to_date = (now + timedelta(days=2)).strftime("%Y-%m-%d")
     events = await fetch_economic_calendar(session, from_date, to_date)
     events = _filter_us_macro_events(events)
+    events = [e for e in events if _is_high_impact_event(e.get("event", ""))]
+    events = await _translate_events(events)
     out: list[dict] = []
     for e in events:
         dt = _parse_event_datetime(e)
@@ -1242,67 +1262,85 @@ _LIQ_HISTORY: deque[dict] = deque()
 _LIQ_MAX_AGE_HOURS = 24
 
 
+async def _get_okx_contract_value(session: aiohttp.ClientSession, inst_id: str) -> float:
+    data = await _get_json(
+        session,
+        f"{OKX_PUBLIC}/instruments",
+        {"instType": "SWAP", "instId": inst_id},
+    )
+    try:
+        if data and data.get("code") == "0" and data.get("data"):
+            return float(data["data"][0].get("ctVal") or 1)
+    except (TypeError, ValueError, KeyError):
+        pass
+    return 1.0
+
+
 async def fetch_liquidations(
     session: aiohttp.ClientSession,
     hours: int = 24,
 ) -> dict[str, dict]:
     """
-    Получает агрегированные ликвидации через CoinGlass API v4.
+    Бесплатные ликвидации через OKX public API.
     Возвращает {symbol: {total_usd, long_usd, short_usd}}.
 
-    Важно: у CoinGlass API нет бесплатного тарифа. Для Hobbyist минимальный
-    interval обычно 4h, поэтому для сводки за 24ч используем 4h как безопасный
-    интервал; если тариф выше — это всё равно работает.
+    Примечание: это не весь рынок, а публичные ликвидации OKX по USDT-SWAP.
+    Для BTC/ETH этого достаточно как бесплатный индикатор всплесков риска.
     """
-    if not config.COINGLASS_API_KEY:
-        return {}
-
     results: dict[str, dict] = {}
-    interval = "4h" if hours >= 4 else "1h"
-    limit = max(1, min(1000, int(hours / 4) if interval == "4h" else hours))
-    exchanges = "Binance,OKX,Bybit"
+    cutoff_ms = int((time.time() - hours * 3600) * 1000)
 
     for sym in config.LIQ_SYMBOLS:
-        coin = symbol_to_coin(sym)
+        sym_norm = _norm_symbol(sym)
+        coin = symbol_to_coin(sym_norm)
+        inst_id = _okx_inst_id(sym_norm)
+        uly = f"{coin}-USDT"
         try:
             data = await _get_json(
                 session,
-                "https://open-api-v4.coinglass.com/api/futures/liquidation/aggregated-history",
-                {
-                    "exchange_list": exchanges,
-                    "symbol": coin,
-                    "interval": interval,
-                    "limit": limit,
-                },
-                headers={
-                    "accept": "application/json",
-                    "CG-API-KEY": config.COINGLASS_API_KEY,
-                },
+                f"{OKX_PUBLIC}/liquidation-orders",
+                {"instType": "SWAP", "uly": uly, "state": "filled"},
             )
-            if not data or str(data.get("code")) != "0" or not data.get("data"):
-                log.warning("CoinGlass v4: no data for %s: %s", coin, data)
+            if not data or data.get("code") != "0" or not data.get("data"):
+                log.info("OKX liquidations: no data for %s: %s", sym_norm, data)
                 continue
 
-            items = data.get("data") or []
+            ct_val = await _get_okx_contract_value(session, inst_id)
             total_usd = 0.0
             long_usd = 0.0
             short_usd = 0.0
-            for item in items:
-                # v4 fields
-                l = float(item.get("aggregated_long_liquidation_usd") or 0)
-                sh = float(item.get("aggregated_short_liquidation_usd") or 0)
-                long_usd += l
-                short_usd += sh
-                total_usd += l + sh
 
-            results[sym.upper()] = {
-                "total_usd": total_usd,
-                "long_usd": long_usd,
-                "short_usd": short_usd,
-            }
+            for block in data.get("data", []):
+                # OKX may return blocks per instFamily; details contain actual orders.
+                for item in block.get("details", []) or []:
+                    try:
+                        ts = int(item.get("ts") or item.get("time") or 0)
+                        if ts and ts < cutoff_ms:
+                            continue
+                        price = float(item.get("bkPx") or 0)
+                        size_contracts = float(item.get("sz") or 0)
+                        usd = size_contracts * ct_val * price
+                        if usd <= 0:
+                            continue
+                        total_usd += usd
+                        pos_side = (item.get("posSide") or "").lower()
+                        side = (item.get("side") or "").lower()
+                        # long liquidation closes long with sell; short liquidation closes short with buy
+                        if pos_side == "long" or side == "sell":
+                            long_usd += usd
+                        elif pos_side == "short" or side == "buy":
+                            short_usd += usd
+                    except (TypeError, ValueError):
+                        continue
 
+            if total_usd > 0:
+                results[sym_norm] = {
+                    "total_usd": total_usd,
+                    "long_usd": long_usd,
+                    "short_usd": short_usd,
+                }
         except Exception as e:
-            log.warning("CoinGlass error for %s: %s", coin, e)
+            log.warning("OKX liquidation error for %s: %s", sym_norm, e)
 
     return results
 
@@ -1313,19 +1351,13 @@ async def build_liquidations_text(hours: int = 24) -> str:
         data = await fetch_liquidations(s, hours=hours)
 
     if not data:
-        if not config.COINGLASS_API_KEY:
-            return (
-                "💥 *Ликвидации*\n\n"
-                "⚠️ Не задан `COINGLASS_API_KEY` в `.env`.\n"
-                "У CoinGlass сейчас нет бесплатного API-тарифа; минимальный план — Hobbyist.\n"
-                "После оплаты добавь ключ в переменную `COINGLASS_API_KEY`.\n\n"
-                "_Без ключа данные о ликвидациях недоступны._"
-            )
         return (
             f"💥 *Ликвидации за {hours}ч*\n\n"
-            f"Нет данных по `{', '.join(config.LIQ_SYMBOLS)}`.\n"
-            "_Попробуй позже._"
+            "Нет свежих публичных ликвидаций по выбранным монетам на OKX.\n"
+            "_Данные бесплатные: OKX USDT-SWAP, без CoinGlass._"
         )
+
+
 
     lines = [f"💥 *Ликвидации за {hours}ч*\n"]
     total_all = 0.0
