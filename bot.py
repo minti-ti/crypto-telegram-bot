@@ -76,6 +76,21 @@ async def _send_or_edit(
         )
 
 
+def _md(text: str | None) -> str:
+    """Минимально экранирует пользовательский/внешний текст для Telegram Markdown."""
+    if not text:
+        return ""
+    return (
+        str(text)
+        .replace("\\", "\\\\")
+        .replace("*", "")
+        .replace("`", "")
+        .replace("[", "(")
+        .replace("]", ")")
+        .replace("_", " ")
+    )
+
+
 # ─────────────────────────── FSM ───────────────────────────────
 class ConvertState(StatesGroup):
     waiting_input = State()
@@ -247,7 +262,7 @@ async def _send_price(target: types.Message | types.CallbackQuery, symbol: str) 
     async with services._shared_session() as s:
         ticker = await services._get_json(
             s,
-            "https://fapi.binance.com/fapi/v1/ticker/24hr",
+            f"{services.BINANCE_SPOT}/ticker/24hr",
             {"symbol": sym},
         )
     if not ticker:
@@ -361,35 +376,44 @@ async def cmd_funding(m: types.Message) -> None:
 
 # ─────────────────────────── /news ──────────────────────────────
 def _format_news_message(items: list[dict], coins_filter: list[str] | None = None) -> str:
-    """Форматирует список отфильтрованных новостей в одно сообщение.
-    Использует title_ru (перевод) если есть, иначе оригинальный заголовок."""
+    """Форматирует список важных новостей. Заголовки всегда на русском,
+    оригинал — второй строкой, если отличается. Внешний текст экранируется.
+    """
     if not items:
         return (
             "📰 Свежих важных новостей нет"
             + (f" по `{', '.join(coins_filter)}`" if coins_filter else "")
             + " за последние 24ч."
         )
-    header = "📰 *Важные новости за 24ч"
+
+    header = "📰 *Самые важные новости за 24ч"
     if coins_filter:
         header += f" ({', '.join(coins_filter)})"
     header += ":*\n"
     lines = [header]
-    for it in items:
-        title_ru = (it.get("title_ru") or "").strip()
-        title_orig = it["title"].replace("*", "").replace("`", "")
-        if title_ru and title_ru.lower() != title_orig.lower():
-            title_part = f"{title_ru}*\n  _{title_orig}_"
+
+    for it in items[:8]:
+        title_orig = _md(it.get("title", ""))
+        title_ru = _md((it.get("title_ru") or "").strip())
+        if not title_ru:
+            title_ru = title_orig
+
+        if title_ru and title_orig and title_ru.lower() != title_orig.lower():
+            title_part = f"*{title_ru}*\n  _{title_orig}_"
         else:
-            title_part = f"{title_orig}*"
-        coins = it.get("coins", [])
-        coin_part = f" `[{' '.join(coins[:4])}]`" if coins else ""
+            title_part = f"*{title_orig}*"
+
+        coins = [c for c in it.get("coins", []) if isinstance(c, str)]
+        coin_part = f" `[{_md(' '.join(coins[:4]))}]`" if coins else ""
         fire = "🔥 " if it.get("importance") == "high" else ""
-        reason = it.get("reason", "").strip()
+        reason = _md((it.get("reason") or "").strip())
         reason_part = f"\n  _{reason}_" if reason else ""
-        source = it.get("source") or "source"
+        source = _md(it.get("source") or "source")
+        url = it.get("url", "")
+
         lines.append(
             f"• {fire}{title_part}{coin_part}{reason_part}\n"
-            f"  [↗ {source}]({it['url']})"
+            f"  [↗ {source}]({url})"
         )
     return "\n\n".join(lines)
 
@@ -514,7 +538,7 @@ async def cmd_oi(m: types.Message, command: CommandObject) -> None:
 async def _send_top(target: types.Message | types.CallbackQuery) -> None:
     async with services._shared_session() as s:
         data = await services._get_json(
-            s, "https://fapi.binance.com/fapi/v1/ticker/24hr"
+            s, f"{services.BINANCE_SPOT}/ticker/24hr"
         )
     if not data:
         await _send_or_edit(target, "⚠️ Не удалось получить данные.", reply_markup=kb_market())
@@ -816,21 +840,21 @@ async def check_news_job() -> None:
                 target_users.update(users)
         if not target_users:
             continue
-        title_orig = it["title"].replace("*", "").replace("`", "")
-        title_ru = (it.get("title_ru") or "").strip()
-        coins = it.get("coins", [])
-        coin_part = f" `[{' '.join(coins[:4])}]`" if coins else ""
+        title_orig = _md(it.get("title", ""))
+        title_ru = _md((it.get("title_ru") or "").strip()) or title_orig
+        coins = [c for c in it.get("coins", []) if isinstance(c, str)]
+        coin_part = f" `[{_md(' '.join(coins[:4]))}]`" if coins else ""
         fire = "🔥 " if it.get("importance") == "high" else ""
-        reason = it.get("reason", "").strip()
+        reason = _md((it.get("reason") or "").strip())
         # Перевод на русский если есть
-        if title_ru and title_ru.lower() != title_orig.lower():
-            title_part = f"{title_ru}*\n  _{title_orig}_"
+        if title_ru and title_orig and title_ru.lower() != title_orig.lower():
+            title_part = f"*{title_ru}*\n  _{title_orig}_"
         else:
-            title_part = f"{title_orig}*"
+            title_part = f"*{title_orig}*"
         reason_part = f"\n_{reason}_" if reason else ""
-        source = it.get("source") or "source"
+        source = _md(it.get("source") or "source")
         text = (
-            f"📰 {fire}*{title_part}{coin_part}{reason_part}\n"
+            f"📰 {fire}{title_part}{coin_part}{reason_part}\n"
             f"[↗ {source}]({url})"
         )
         for uid in target_users:

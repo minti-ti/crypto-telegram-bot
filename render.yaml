@@ -17,6 +17,10 @@ services:
         sync: false
       - key: COINGECKO_API_KEY
         sync: false
+      - key: FINNHUB_API_KEY
+        sync: false
+      - key: COINGLASS_API_KEY
+        sync: false
       - key: MORNING_TIME
         value: "09:00"
       - key: PORT

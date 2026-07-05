@@ -478,19 +478,36 @@ async def filter_news_with_llm(
         return []
 
     if not config.OPENROUTER_API_KEY:
-        # Fallback: эвристика + перевод через Google Translate
+        # Fallback без LLM: НЕ шлём весь RSS, а оставляем только важные события
+        # по правилам (регуляторы, ETF, взломы, крупные листинги, макро и т.п.)
+        # и переводим заголовки на русский.
         out: list[dict] = []
-        candidates = items[:config.NEWS_MAX_PER_LLM]
-        translations = await _translate_titles([it["title"] for it in candidates])
-        for it, title_ru in zip(candidates, translations):
-            coins = _extract_coins_from_text(it["title"])
-            if target_coins and not (set(coins) & set(target_coins)):
-                if not coins and not _has_crypto_keywords(it["title"]):
-                    continue
+        target_set = {c.upper() for c in (target_coins or [])}
+        candidates: list[tuple[dict, list[str], str, str]] = []
+        for it in items[:config.NEWS_MAX_PER_LLM]:
+            title = it.get("title", "")
+            is_important, importance, reason = _classify_news_importance(title)
+            if not is_important:
+                continue
+            coins = _extract_coins_from_text(title)
+            # Если пользователь запросил конкретные монеты — показываем:
+            # 1) новости по этим монетам, 2) обще-рыночные новости без конкретного тикера.
+            if target_set and coins and not (set(coins) & target_set):
+                continue
+            candidates.append((it, coins, importance, reason))
+
+        translations = await _translate_titles([it["title"] for it, *_ in candidates])
+        for (it, coins, importance, reason), title_ru in zip(candidates, translations):
             out.append({
-                **it, "coins": coins, "reason": "", "title_ru": title_ru,
+                **it,
+                "coins": coins,
+                "reason": reason,
+                "importance": importance,
+                "title_ru": title_ru,
             })
-        return out
+        # Ограничиваемся самыми свежими/важными, чтобы бот не превращался в RSS-ленту.
+        out.sort(key=lambda x: (0 if x.get("importance") == "high" else 1, -(x.get("ts") or 0)))
+        return out[:8]
 
     payload_items = [
         {
@@ -612,6 +629,45 @@ def _has_crypto_keywords(text: str) -> bool:
     return any(kw in t for kw in _CRYPTO_KW)
 
 
+_HIGH_IMPORTANCE_KW = (
+    "sec", "cftc", "fomc", "federal reserve", "fed ", "interest rate",
+    "cpi", "inflation", "nonfarm", "payroll", "jobs report",
+    "etf", "blackrock", "fidelity", "microstrategy", "strategy buys",
+    "hack", "hacked", "exploit", "exploited", "stolen", "breach",
+    "lawsuit", "sues", "settlement", "settles", "fine", "charged", "charges",
+    "ban", "bans", "approval", "approves", "approved", "rejects", "rejected",
+    "delist", "delisting", "lists", "listing on binance", "coinbase lists",
+    "bankruptcy", "insolvency", "default", "reserve", "depeg", "stablecoin",
+)
+
+_MEDIUM_IMPORTANCE_KW = (
+    "mainnet", "hard fork", "upgrade", "token unlock", "airdrop",
+    "merger", "acquisition", "raises", "funding round", "partnership",
+    "treasury", "buyback", "burn", "staking", "validator",
+    "etp", "futures", "options", "open interest", "liquidation",
+)
+
+_CLICKBAIT_OR_LOW_VALUE_KW = (
+    "price prediction", "could reach", "will reach", "analyst says",
+    "top 3", "best crypto", "to buy", "presale", "sponsored",
+    "opinion", "how to", "guide", "what is", "learn",
+)
+
+
+def _classify_news_importance(title: str) -> tuple[bool, str, str]:
+    """Грубый fallback-фильтр новостей, когда нет OPENROUTER_API_KEY.
+    Возвращает: (важная ли, high/medium, причина на русском).
+    """
+    t = (title or "").lower()
+    if not t or any(k in t for k in _CLICKBAIT_OR_LOW_VALUE_KW):
+        return False, "medium", ""
+    if any(k in t for k in _HIGH_IMPORTANCE_KW):
+        return True, "high", "Событие может заметно повлиять на рынок: регуляторы, ETF, безопасность, листинг или макро."
+    if any(k in t for k in _MEDIUM_IMPORTANCE_KW) and _has_crypto_keywords(title):
+        return True, "medium", "Важное отраслевое событие: обновление, токеномика, инфраструктура или деривативы."
+    return False, "medium", ""
+
+
 _KNOWN_COINS = [
     "BTC", "ETH", "SOL", "TON", "BNB", "XRP", "ADA", "DOGE",
     "AVAX", "DOT", "MATIC", "LINK", "TRX", "LTC", "BCH", "ATOM",
@@ -620,12 +676,35 @@ _KNOWN_COINS = [
 ]
 
 
+_COIN_ALIASES = {
+    "BTC": ("bitcoin", "btc"),
+    "ETH": ("ethereum", "ether", "eth"),
+    "SOL": ("solana", "sol"),
+    "TON": ("toncoin", "the open network", "ton"),
+    "BNB": ("bnb", "binance coin"),
+    "XRP": ("xrp", "ripple"),
+    "ADA": ("cardano", "ada"),
+    "DOGE": ("dogecoin", "doge"),
+    "TRX": ("tron", "trx"),
+    "LINK": ("chainlink", "link"),
+    "AVAX": ("avalanche", "avax"),
+    "DOT": ("polkadot", "dot"),
+    "SUI": ("sui",),
+}
+
+
 def _extract_coins_from_text(text: str) -> list[str]:
     found: set[str] = set()
     upper = text.upper()
+    lower = text.lower()
     for coin in _KNOWN_COINS:
-        if re.search(rf"(?<![A-Z]){coin}(?![A-Z])", upper):
+        if re.search(rf"(?<![A-Z0-9]){coin}(?![A-Z0-9])", upper):
             found.add(coin)
+    for coin, aliases in _COIN_ALIASES.items():
+        for alias in aliases:
+            if re.search(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", lower):
+                found.add(coin)
+                break
     return sorted(found)
 
 
@@ -974,55 +1053,53 @@ async def fetch_liquidations(
     hours: int = 24,
 ) -> dict[str, dict]:
     """
-    Получает ликвидации через CoinGlass API.
-    Возвращает {symbol: {total_usd, long_usd, short_usd, data: [...]}}
+    Получает агрегированные ликвидации через CoinGlass API v4.
+    Возвращает {symbol: {total_usd, long_usd, short_usd}}.
+
+    Важно: у CoinGlass API нет бесплатного тарифа. Для Hobbyist минимальный
+    interval обычно 4h, поэтому для сводки за 24ч используем 4h как безопасный
+    интервал; если тариф выше — это всё равно работает.
     """
     if not config.COINGLASS_API_KEY:
         return {}
 
     results: dict[str, dict] = {}
-    symbols = config.LIQ_SYMBOLS
+    interval = "4h" if hours >= 4 else "1h"
+    limit = max(1, min(1000, int(hours / 4) if interval == "4h" else hours))
+    exchanges = "Binance,OKX,Bybit"
 
-    for sym in symbols:
+    for sym in config.LIQ_SYMBOLS:
         coin = symbol_to_coin(sym)
         try:
             data = await _get_json(
                 session,
-                "https://open-api.coinglass.com/public/v2/liquidation_history",
+                "https://open-api-v4.coinglass.com/api/futures/liquidation/aggregated-history",
                 {
+                    "exchange_list": exchanges,
                     "symbol": coin,
-                    "time_type": "2",  # 2 = hours
-                    "time": str(hours),
+                    "interval": interval,
+                    "limit": limit,
                 },
-                headers={"CG-API-KEY": config.COINGLASS_API_KEY},
+                headers={
+                    "accept": "application/json",
+                    "CG-API-KEY": config.COINGLASS_API_KEY,
+                },
             )
-            if not data or not data.get("success") or not data.get("data"):
-                log.warning("CoinGlass: no data for %s", coin)
+            if not data or str(data.get("code")) != "0" or not data.get("data"):
+                log.warning("CoinGlass v4: no data for %s: %s", coin, data)
                 continue
 
-            items = data["data"]
-            if not isinstance(items, list):
-                # data может быть dict с volUsd
-                if isinstance(items, dict):
-                    total_usd = float(items.get("volUsd") or 0)
-                    long_usd = float(items.get("longVolUsd") or 0)
-                    short_usd = float(items.get("shortVolUsd") or 0)
-                    results[sym.upper()] = {
-                        "total_usd": total_usd,
-                        "long_usd": long_usd,
-                        "short_usd": short_usd,
-                    }
-                continue
-
+            items = data.get("data") or []
             total_usd = 0.0
             long_usd = 0.0
             short_usd = 0.0
             for item in items:
-                vol = float(item.get("volUsd") or 0)
-                total_usd += vol
-                # CoinGlass: longVolUsd / shortVolUsd
-                long_usd += float(item.get("longVolUsd") or 0)
-                short_usd += float(item.get("shortVolUsd") or 0)
+                # v4 fields
+                l = float(item.get("aggregated_long_liquidation_usd") or 0)
+                sh = float(item.get("aggregated_short_liquidation_usd") or 0)
+                long_usd += l
+                short_usd += sh
+                total_usd += l + sh
 
             results[sym.upper()] = {
                 "total_usd": total_usd,
@@ -1046,7 +1123,8 @@ async def build_liquidations_text(hours: int = 24) -> str:
             return (
                 "💥 *Ликвидации*\n\n"
                 "⚠️ Не задан `COINGLASS_API_KEY` в `.env`.\n"
-                "Получи бесплатный ключ на [coinglass.com/api](https://www.coinglass.com/pro/futures/LiquidationInfo)\n\n"
+                "У CoinGlass сейчас нет бесплатного API-тарифа; минимальный план — Hobbyist.\n"
+                "После оплаты добавь ключ в переменную `COINGLASS_API_KEY`.\n\n"
                 "_Без ключа данные о ликвидациях недоступны._"
             )
         return (
@@ -1080,7 +1158,9 @@ async def build_liquidations_text(hours: int = 24) -> str:
 # ─────────────────────────── утренняя сводка ────────────────────
 async def build_morning_briefing() -> str:
     lines: list[str] = []
-    today = datetime.now(timezone.utc).strftime("%d.%m.%Y")
+    now_utc = datetime.now(timezone.utc)
+    today = now_utc.strftime("%d.%m.%Y")
+    today_api = now_utc.strftime("%Y-%m-%d")
     lines.append(f"☀️ *Утренняя сводка — {today}*")
     lines.append("")
 
@@ -1090,7 +1170,7 @@ async def build_morning_briefing() -> str:
             get_24h_tickers(s, config.TOP_SYMBOLS),
             get_global_market(s),
             asyncio.gather(*[get_funding_rate(s, x) for x in config.FUNDING_SYMBOLS]),
-            fetch_economic_calendar(s, today, today),
+            fetch_economic_calendar(s, today_api, today_api),
         )
 
     if cal_events:
