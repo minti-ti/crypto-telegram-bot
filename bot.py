@@ -1,4 +1,4 @@
-"""Точка входа: хендлеры, планировщик, проверка алертов и новостей."""
+"""Точка входа: хендлеры, планировщик и новости."""
 from __future__ import annotations
 
 import asyncio
@@ -26,8 +26,7 @@ import services
 from keyboards import (
     main_menu_kb,
     kb_price, kb_price_symbols, kb_market, kb_news_my_subs, kb_news_after,
-    kb_alerts_list, kb_alert_confirm,
-    kb_subs_current, kb_settime, kb_calc, kb_calendar, kb_liq,
+    kb_subs_current, kb_settime, kb_calendar, kb_liq,
     cancel_kb,
 )
 
@@ -79,12 +78,6 @@ async def _send_or_edit(
 
 
 # ─────────────────────────── FSM ───────────────────────────────
-class AddAlert(StatesGroup):
-    waiting_symbol = State()
-    waiting_direction = State()
-    waiting_price = State()
-
-
 class ConvertState(StatesGroup):
     waiting_input = State()
 
@@ -97,17 +90,14 @@ class SubCustomCoin(StatesGroup):
     waiting_coin = State()
 
 
-class CalcState(StatesGroup):
-    side = State()
-    entry_price = State()
-    exit_price = State()
-    position_size = State()
-    leverage = State()
-    fee_percent = State()
-
-
 class PriceCustomState(StatesGroup):
     waiting_coin = State()
+
+
+class RiskCalc(StatesGroup):
+    deposit = State()  # депозит в USD
+    entry = State()    # цена входа
+    stop = State()     # стоп-лосс
 
 
 # ─────────────────────────── /start и меню ─────────────────────
@@ -124,10 +114,6 @@ HELP_TEXT = (
     "`/calendar` — экономический календарь (US)\n"
     "`/liq` — ликвидации за час (BTC/ETH)\n"
     "`/calc` — калькулятор позиции\n\n"
-    "*Алерты:*\n"
-    "`/alert BTCUSDT above 70000` — сработает при пробое 70000\n"
-    "`/alerts` — список\n"
-    "`/delalert <id>` — удалить\n\n"
     "*Подписки на новости:*\n"
     "`/subscribe BTC,ETH,SOL` — присылать важные новости\n"
     "`/unsubscribe BTC`\n"
@@ -172,9 +158,6 @@ async def cb_menu(c: types.CallbackQuery, state: FSMContext) -> None:
         return
     if cmd == "funding":
         await _send_funding(c)
-        return
-    if cmd == "alerts":
-        await _show_alerts(c)
         return
     if cmd == "subs":
         await _show_subs(c)
@@ -238,6 +221,12 @@ async def cb_menu(c: types.CallbackQuery, state: FSMContext) -> None:
     if cmd == "liq":
         await _send_liq(c)
         return
+
+
+@router.callback_query(F.data == "noop")
+async def cb_noop(c: types.CallbackQuery) -> None:
+    """Заглушка для информационных кнопок-разделителей."""
+    await c.answer()
 
 
 @router.callback_query(F.data == "cancel")
@@ -367,9 +356,6 @@ async def cmd_funding(m: types.Message) -> None:
     await _send_funding(m)
 
 
-
-
-
 # ─────────────────────────── /news ──────────────────────────────
 def _format_news_message(items: list[dict], coins_filter: list[str] | None = None) -> str:
     """Форматирует список отфильтрованных новостей в одно сообщение.
@@ -473,7 +459,7 @@ async def _send_oi(target: types.Message | types.CallbackQuery, symbol: str) -> 
 
     # USD value of current OI
     oi_usd = current * price if price else None
-    oi_usd_str = f" ({fmt_volume(oi_usd)})" if oi_usd else ""
+    oi_usd_str = f" ({services.fmt_volume(oi_usd)})" if oi_usd else ""
 
     msg = (
         f"📊 *Open Interest — {coin}*\n\n"
@@ -660,157 +646,6 @@ async def _zero() -> float:
     return 1.0
 
 
-# ─────────────────────────── /alert ─────────────────────────────
-@router.message(Command("alert"))
-async def cmd_alert(m: types.Message, command: CommandObject) -> None:
-    """
-    Поддерживает:
-      /alert BTCUSDT above 70000
-      /alert ETH above 3000
-      /alert (без аргументов → интерактивный режим)
-    """
-    if not command.args:
-        await m.answer(
-            "Формат:\n"
-            "`/alert BTCUSDT above 70000`\n"
-            "`/alert ETH below 3000`\n\n"
-            "Или нажми кнопку ниже для пошагового создания.",
-            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
-                [types.InlineKeyboardButton(
-                    text="➕ Создать алерт (пошагово)",
-                    callback_data="alert:start",
-                )]
-            ]),
-        )
-        return
-    parts = command.args.upper().split()
-    if len(parts) != 3:
-        await m.answer(
-            "❌ Неверный формат. Пример:\n"
-            "`/alert BTCUSDT above 70000`"
-        )
-        return
-    sym, direction, price_s = parts
-    if direction not in ("ABOVE", "BELOW"):
-        await m.answer("Направление должно быть `above` или `below`.")
-        return
-    try:
-        price = float(price_s.replace(",", "."))
-    except ValueError:
-        await m.answer("Цена должна быть числом.")
-        return
-    if not sym.endswith("USDT"):
-        sym = sym + "USDT"
-    alert_id = await db.add_alert(m.from_user.id, sym, direction.lower(), price)
-    await m.answer(
-        f"✅ Алерт создан (id *{alert_id}*):\n"
-        f"`{services.symbol_to_coin(sym)}` {direction.lower()} {price:g}\n"
-        f"Бот пришлёт сообщение, когда условие сработает.",
-        reply_markup=kb_alerts_list([]),
-    )
-
-
-@router.callback_query(F.data == "alert:start")
-async def cb_alert_start(c: types.CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(AddAlert.waiting_symbol)
-    await _send_or_edit(
-        c,
-        "Введи тикер монеты (например `BTC` или `BTCUSDT`):",
-        reply_markup=cancel_kb(),
-    )
-    await c.answer()
-
-
-@router.message(AddAlert.waiting_symbol)
-async def alert_symbol(m: types.Message, state: FSMContext) -> None:
-    sym = m.text.strip().upper().replace("/", "")
-    if not sym.endswith("USDT"):
-        sym += "USDT"
-    await state.update_data(symbol=sym)
-    await state.set_state(AddAlert.waiting_direction)
-    await m.answer(
-        f"Тикер: *{sym}*\n"
-        "Теперь выбери направление:",
-        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
-            [
-                types.InlineKeyboardButton(
-                    text="📈 Above (выше)", callback_data="alert:dir:above"
-                ),
-                types.InlineKeyboardButton(
-                    text="📉 Below (ниже)", callback_data="alert:dir:below"
-                ),
-            ],
-            [types.InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
-        ]),
-    )
-
-
-@router.callback_query(F.data.startswith("alert:dir:"))
-async def cb_alert_dir(c: types.CallbackQuery, state: FSMContext) -> None:
-    direction = c.data.split(":")[2]
-    await state.update_data(direction=direction)
-    await state.set_state(AddAlert.waiting_price)
-    await _send_or_edit(c, "Введи целевую цену (число):", reply_markup=cancel_kb())
-    await c.answer()
-
-
-@router.message(AddAlert.waiting_price)
-async def alert_price(m: types.Message, state: FSMContext) -> None:
-    try:
-        price = float(m.text.replace(",", "."))
-    except ValueError:
-        await m.answer("❌ Это не число. Попробуй ещё раз:")
-        return
-    data = await state.get_data()
-    alert_id = await db.add_alert(
-        m.from_user.id, data["symbol"], data["direction"], price
-    )
-    await state.clear()
-    await m.answer(
-        f"✅ Алерт создан (id *{alert_id}*):\n"
-        f"`{services.symbol_to_coin(data['symbol'])}` "
-        f"{data['direction']} {price:g}",
-        reply_markup=kb_alerts_list([]),
-    )
-
-
-async def _show_alerts(target: types.Message | types.CallbackQuery) -> None:
-    user_id = target.from_user.id if hasattr(target, "from_user") else target.chat.id
-    rows = await db.list_user_alerts(user_id)
-    if not rows:
-        await _send_or_edit(
-            target,
-            "У тебя нет алертов. Создай: `/alert BTCUSDT above 70000`",
-            reply_markup=kb_alerts_list([]),
-        )
-        return
-    lines = ["🚨 *Твои алерты:*"]
-    for r in rows:
-        status = "✅ сработал" if r["triggered"] else "⏳ активен"
-        coin = services.symbol_to_coin(r["symbol"])
-        lines.append(
-            f"• *#{r['id']}* `{coin}` {r['direction']} {r['price']:g} — {status}"
-        )
-    lines.append("\nУдалить: `/delalert <id>`")
-    await _send_or_edit(target, "\n".join(lines), reply_markup=kb_alerts_list([]))
-
-
-@router.message(Command("alerts"))
-async def cmd_alerts(m: types.Message) -> None:
-    await _show_alerts(m)
-
-
-@router.message(Command("delalert"))
-async def cmd_delalert(m: types.Message, command: CommandObject) -> None:
-    if not command.args or not command.args.isdigit():
-        await m.answer("Формат: `/delalert 5`")
-        return
-    if await db.delete_alert(m.from_user.id, int(command.args)):
-        await m.answer(f"🗑 Алерт #{command.args} удалён.", reply_markup=kb_alerts_list([]))
-    else:
-        await m.answer("❌ Алерт не найден или не принадлежит тебе.", reply_markup=kb_alerts_list([]))
-
-
 # ─────────────────────────── подписки на новости ─────────────────
 @router.message(Command("subscribe"))
 async def cmd_subscribe(m: types.Message, command: CommandObject) -> None:
@@ -933,43 +768,6 @@ async def morning_job() -> None:
         log.info("Morning briefing sent to %s users", len(users))
     except Exception as e:
         log.exception("Morning job error: %s", e)
-
-
-async def check_alerts_job() -> None:
-    """Проверяет активные алерты каждые 30 секунд."""
-    alerts = await db.active_alerts()
-    if not alerts:
-        return
-    # группируем по символам, чтобы делать 1 запрос на символ
-    by_symbol: dict[str, list] = {}
-    for a in alerts:
-        by_symbol.setdefault(a["symbol"], []).append(a)
-
-    async with services._shared_session() as s:
-        for sym, items in by_symbol.items():
-            price = await services.get_price(s, sym)
-            if price is None:
-                continue
-            for a in items:
-                hit = (
-                    (a["direction"] == "above" and price >= a["price"]) or
-                    (a["direction"] == "below" and price <= a["price"])
-                )
-                if not hit:
-                    continue
-                await db.mark_triggered(a["id"])
-                coin = services.symbol_to_coin(sym)
-                arrow = "📈" if a["direction"] == "above" else "📉"
-                text = (
-                    f"{arrow} *АЛЕРТ #{a['id']}*\n"
-                    f"`{coin}` достиг(ла) *{services.fmt_usd(price)}*\n"
-                    f"Условие: {a['direction']} {a['price']:g}"
-                )
-                try:
-                    await bot.send_message(a["user_id"], text)
-                    log.info("Alert %s triggered for user %s", a["id"], a["user_id"])
-                except Exception as e:
-                    log.warning("Failed to send alert: %s", e)
 
 
 async def check_news_job() -> None:
@@ -1141,12 +939,6 @@ async def setup_scheduler() -> AsyncIOScheduler:
         replace_existing=True,
     )
     sched.add_job(
-        check_alerts_job,
-        IntervalTrigger(seconds=30),
-        id="alerts",
-        replace_existing=True,
-    )
-    sched.add_job(
         check_news_job,
         IntervalTrigger(minutes=5),
         id="news",
@@ -1167,7 +959,6 @@ async def setup_scheduler() -> AsyncIOScheduler:
     return sched
 
 
-# ─────────────────────────── main ───────────────────────────────
 # ─────────────────────────── /settime ────────────────────────────
 @router.message(Command("settime"))
 async def cmd_settime(m: types.Message, command: CommandObject) -> None:
@@ -1356,52 +1147,7 @@ async def cb_unsub_coin(c: types.CallbackQuery) -> None:
     )
 
 
-# ─────────────────────────── Alert delete callbacks ────────────
-@router.callback_query(F.data.startswith("alert:del:"))
-async def cb_alert_delete(c: types.CallbackQuery) -> None:
-    alert_id = int(c.data.split(":")[2])
-    if await db.delete_alert(c.from_user.id, alert_id):
-        await c.answer(f"🗑 Алерт #{alert_id} удалён")
-        # Обновим список
-        rows = await db.list_user_alerts(c.from_user.id)
-        alerts = [dict(r) for r in rows]
-        if alerts:
-            lines = ["🚨 *Твои алерты:*\nНажми 🗑 чтобы удалить."]
-            for a in alerts:
-                status = "✅ сработал" if a["triggered"] else "⏳ активен"
-                coin = services.symbol_to_coin(a["symbol"])
-                arrow = "📈" if a["direction"] == "above" else "📉"
-                lines.append(
-                    f"{arrow} *#{a['id']}* `{coin}` {a['direction']} {a['price']:g} — {status}"
-                )
-            await _send_or_edit(
-                c,
-                "\n".join(lines),
-                reply_markup=kb_alerts_list(alerts),
-            )
-        else:
-            await _send_or_edit(
-                c,
-                "🚨 *Алерты*\n\nУ тебя больше нет алертов.",
-                reply_markup=kb_alerts_list([]),
-            )
-    else:
-        await c.answer("❌ Не удалось удалить")
-
-
-@router.callback_query(F.data == "alert:noop")
-async def cb_alert_noop(c: types.CallbackQuery) -> None:
-    """Заглушка для неактивной кнопки-информации."""
-    await c.answer()
-
-
 # ─────────────────────────── Калькулятор позиции ────────────────
-class RiskCalc(StatesGroup):
-    deposit = State()  # депозит в USD
-    entry = State()    # цена входа
-    stop = State()     # стоп-лосс
-
-
 @router.message(Command("calc"))
 async def cmd_calc(m: types.Message, state: FSMContext) -> None:
     await state.set_state(RiskCalc.deposit)
@@ -1495,7 +1241,7 @@ async def on_startup() -> None:
     _scheduler = await setup_scheduler()
     _scheduler.start()
     log.info(
-        "Scheduler started: morning at %s MSK, alerts every 30s, news every 5min",
+        "Scheduler started: morning at %s MSK, news every 5min",
         config.MORNING_TIME,
     )
     # Health-сервер (для Render Web Service)

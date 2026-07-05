@@ -27,16 +27,12 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📋 Сводка", callback_data="cmd:briefing"),
         ],
         [
-            InlineKeyboardButton(text="🚨 Алерты", callback_data="cmd:alerts"),
             InlineKeyboardButton(text="🔔 Подписки", callback_data="cmd:subs"),
         ],
         [
             InlineKeyboardButton(text="⚙️ Время сводки", callback_data="cmd:settime"),
         ],
     ])
-
-
-
 
 
 # ─────────────────────────── /price ───────────────────────────────
@@ -63,9 +59,6 @@ def kb_price(symbol: str) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text=f"📈 Funding {coin}", callback_data="cmd:funding"),
             InlineKeyboardButton(text=f"📰 Новости {coin}", callback_data=f"news:{coin}"),
-        ],
-        [
-            InlineKeyboardButton(text="🚨 Создать алерт", callback_data="alert:start"),
         ],
         [InlineKeyboardButton(text="🏠 Меню", callback_data="cmd:menu")],
     ])
@@ -113,46 +106,6 @@ def kb_news_after(coin: str) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="🔔 Подписаться", callback_data=f"sub:{coin}"),
             InlineKeyboardButton(text="✏️ Другая монета", callback_data="news:custom"),
-        ],
-        [InlineKeyboardButton(text="🏠 Меню", callback_data="cmd:menu")],
-    ])
-
-
-# ─────────────────────────── /alerts ────────────────────────────
-def kb_alerts_list(alerts: list) -> InlineKeyboardMarkup:
-    """Список алертов с inline-кнопками удаления."""
-    rows: list[list[InlineKeyboardButton]] = []
-    if not alerts:
-        rows.append([
-            InlineKeyboardButton(text="➕ Создать первый алерт", callback_data="alert:start"),
-        ])
-    else:
-        for a in alerts:
-            coin = _symbol_to_coin(a["symbol"]) if isinstance(a, dict) else a[1]
-            direction = a["direction"] if isinstance(a, dict) else a[2]
-            price = a["price"] if isinstance(a, dict) else a[3]
-            triggered = a["triggered"] if isinstance(a, dict) else a[4]
-            alert_id = a["id"] if isinstance(a, dict) else a[0]
-            status = "✅" if triggered else "⏳"
-            arrow = "📈" if direction == "above" else "📉"
-            label = f"{status}{arrow} {coin} {direction} {price:g}"
-            rows.append([
-                InlineKeyboardButton(text=label, callback_data=f"alert:noop"),
-                InlineKeyboardButton(text="🗑", callback_data=f"alert:del:{alert_id}"),
-            ])
-        rows.append([
-            InlineKeyboardButton(text="➕ Добавить алерт", callback_data="alert:start"),
-        ])
-    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="cmd:menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def kb_alert_confirm(symbol: str, direction: str, price: float, alert_id: int) -> InlineKeyboardMarkup:
-    """Подтверждение после создания алерта."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📋 Все алерты", callback_data="cmd:alerts"),
-            InlineKeyboardButton(text="➕ Ещё один", callback_data="alert:start"),
         ],
         [InlineKeyboardButton(text="🏠 Меню", callback_data="cmd:menu")],
     ])

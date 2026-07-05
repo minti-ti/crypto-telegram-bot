@@ -164,46 +164,7 @@ async def set_morning(user_id: int, value: bool) -> None:
     )
 
 
-# ─────────────────────────── Alerts ─────────────────────────────
-async def add_alert(user_id: int, symbol: str, direction: str, price: float) -> int:
-    await upsert_user(user_id)
-    new_id = await _fetchval(
-        """INSERT INTO alerts(user_id, symbol, direction, price, created_at)
-           VALUES ($1, $2, $3, $4, $5) RETURNING id""",
-        user_id, symbol.upper(), direction, price, _now(),
-    )
-    return int(new_id)
 
-
-async def list_user_alerts(user_id: int) -> list[asyncpg.Record]:
-    return await _fetchall(
-        """SELECT id, symbol, direction, price, triggered, created_at
-           FROM alerts WHERE user_id = $1
-           ORDER BY triggered ASC, created_at DESC""",
-        user_id,
-    )
-
-
-async def delete_alert(user_id: int, alert_id: int) -> bool:
-    status = await _execute(
-        "DELETE FROM alerts WHERE id = $1 AND user_id = $2",
-        alert_id, user_id,
-    )
-    # asyncpg возвращает "DELETE N"
-    return status.endswith(" 1")
-
-
-async def active_alerts() -> list[asyncpg.Record]:
-    return await _fetchall(
-        """SELECT id, user_id, symbol, direction, price
-           FROM alerts WHERE triggered = 0"""
-    )
-
-
-async def mark_triggered(alert_id: int) -> None:
-    await _execute(
-        "UPDATE alerts SET triggered = 1 WHERE id = $1", alert_id,
-    )
 
 
 # ─────────────────────────── News subscriptions ─────────────────

@@ -1,14 +1,24 @@
-# Environment
-.env
-.env.local
-
 # Python
 __pycache__/
 *.py[cod]
+*$py.class
 *.so
-*.egg-info/
-.venv/
+.Python
 venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
 
 # Database
 *.db
@@ -18,19 +28,11 @@ venv/
 # Logs
 *.log
 
-# IDE
-.idea/
-.vscode/
-*.swp
-
 # OS
 .DS_Store
 Thumbs.db
 
-# Bot-specific
-bot.db
-downloads/
-download/bot.py.fixed
-bot.py.orig
-download
-download (1)
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
