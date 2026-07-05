@@ -5,7 +5,6 @@ import asyncio
 import logging
 import re
 import sys
-import time
 from datetime import datetime, timezone
 from aiohttp import web
 
@@ -193,12 +192,16 @@ async def cb_menu(c: types.CallbackQuery, state: FSMContext) -> None:
         return
     if cmd == "news":
         subs = await db.get_user_subs(c.from_user.id)
-        await _send_or_edit(
-            c,
-            "📰 *Новости — выбери монету:*\n"
-            "_Твои подписки сверху. Если нужна другая — нажми 'Другая монета' снизу._",
-            reply_markup=kb_news_my_subs(subs),
-        )
+        # Если есть подписки — показываем меню. Если нет — сразу все новости
+        if subs:
+            await _send_or_edit(
+                c,
+                "📰 *Новости за 24ч — выбери монету:*\n"
+                "_Твои подписки сверху. Если нужна другая — нажми 'Другая монета'._",
+                reply_markup=kb_news_my_subs(subs),
+            )
+        else:
+            await _show_news(c, [], lookback_hours=24)
         return
     if cmd == "price":
         await _send_or_edit(
@@ -364,9 +367,9 @@ def _format_news_message(items: list[dict], coins_filter: list[str] | None = Non
         return (
             "📰 Свежих важных новостей нет"
             + (f" по `{', '.join(coins_filter)}`" if coins_filter else "")
-            + "."
+            + " за последние 24ч."
         )
-    header = "📰 *Важные новости"
+    header = "📰 *Важные новости за 24ч"
     if coins_filter:
         header += f" ({', '.join(coins_filter)})"
     header += ":*\n"
@@ -397,21 +400,20 @@ async def cmd_news(m: types.Message, command: CommandObject) -> None:
         currencies = [
             c.strip().upper() for c in re.split(r"[,\s]+", command.args) if c.strip()
         ]
-        await _show_news(m, currencies)
+        await _show_news(m, currencies, lookback_hours=24)
         return
-    # /news без аргументов — меню с подписками
-    subs = await db.get_user_subs(m.from_user.id)
-    await m.answer(
-        "📰 *Новости — выбери монету:*\n"
-        "_Твои подписки сверху. Если нужна другая — нажми 'Другая монета' снизу._",
-        reply_markup=kb_news_my_subs(subs),
-    )
+    # /news без аргументов — все новости за 24ч
+    await _show_news(m, [], lookback_hours=24)
 
 
-async def _show_news(target: types.Message | types.CallbackQuery, currencies: list[str]) -> None:
+async def _show_news(
+    target: types.Message | types.CallbackQuery,
+    currencies: list[str],
+    lookback_hours: int = 24,
+) -> None:
     """Собрать новости и отправить/отредактировать."""
     await _send_or_edit(target, "⏳ Собираю новости...")
-    raw = await services.fetch_rss_feeds(lookback_hours=config.NEWS_LOOKBACK_HOURS)
+    raw = await services.fetch_rss_feeds(lookback_hours=lookback_hours)
     if not raw:
         await _send_or_edit(
             target,
@@ -432,7 +434,7 @@ async def _show_news(target: types.Message | types.CallbackQuery, currencies: li
 
 # ─────────────────────────── /oi (Open Interest) ────────────────
 async def _send_oi(target: types.Message | types.CallbackQuery, symbol: str) -> None:
-    """Показать Open Interest для монеты."""
+    """Показать Open Interest для монеты (через CoinGecko derivatives)."""
     sym = symbol.upper()
     if not sym.endswith("USDT"):
         sym += "USDT"
@@ -441,41 +443,30 @@ async def _send_oi(target: types.Message | types.CallbackQuery, symbol: str) -> 
     if not result:
         await _send_or_edit(
             target,
-            f"⚠️ Не удалось получить OI для `{sym}`.\n"
-            "_Возможно, Binance недоступен с этого региона._",
+            f"⚠️ Не удалось получить OI для `{sym}`.",
             reply_markup=kb_market(),
         )
         return
 
     coin = services.symbol_to_coin(sym)
     current = result["current_oi"]
-    change = result["change"]
-    pct = result["change_pct"]
     price = result.get("price")
-    change_usd = result.get("change_usd")
+    oi_usd = result.get("oi_usd")
 
-    arrow = "🟢" if change >= 0 else "🔴"
     price_str = f"${price:,.2f}" if price else "—"
-
-    # USD value of current OI
-    oi_usd = current * price if price else None
-    oi_usd_str = f" ({services.fmt_volume(oi_usd)})" if oi_usd else ""
+    oi_usd_str = services.fmt_volume(oi_usd) if oi_usd else "—"
 
     msg = (
         f"📊 *Open Interest — {coin}*\n\n"
-        f"Текущий OI: `{current:,.0f} {coin}`{oi_usd_str}\n"
+        f"Текущий OI: `{current:,.0f} {coin}`\n"
+        f"OI в USD: `{oi_usd_str}`\n"
         f"Цена: `{price_str}`\n\n"
-        f"*{arrow} За 24ч:*\n"
-        f"Изменение: `{change:+,.0f} {coin}` ({pct:+.2f}%)\n"
+        f"_💡 Трактовка:_\n"
+        f"• Высокий OI = больше позиций открыто\n"
+        f"• Рост OI + рост цены = сильный бычий тренд\n"
+        f"• Рост OI + падение цены = медвежье давление\n"
+        f"• Падение OI = позиции закрываются"
     )
-    if change_usd is not None:
-        msg += f"Изменение USD: `{change_usd:+,.0f}`\n"
-
-    msg += "\n_💡 Трактовка:_\n"
-    msg += "• Цена ↑ + OI ↑ = в рынок заходят деньги, тренд сильный\n"
-    msg += "• Цена ↑ + OI ↓ = шорт-сквиз, быстро выдохнется\n"
-    msg += "• Цена ↓ + OI ↑ = паника, шорты наращивают\n"
-    msg += "• Цена ↓ + OI ↓ = лонги закрываются"
 
     await _send_or_edit(target, msg, reply_markup=kb_market())
 
@@ -492,7 +483,7 @@ async def _send_oi_top(target: types.Message | types.CallbackQuery) -> None:
     if not valid:
         await _send_or_edit(
             target,
-            "⚠️ Не удалось получить OI.\n_Возможно, Binance недоступен._",
+            "⚠️ Не удалось получить OI.",
             reply_markup=kb_market(),
         )
         return
@@ -502,9 +493,10 @@ async def _send_oi_top(target: types.Message | types.CallbackQuery) -> None:
         if i >= len(coins):
             break
         coin = coins[i]
-        arrow = "🟢" if r["change"] >= 0 else "🔴"
+        oi_usd = r.get("oi_usd")
+        oi_str = services.fmt_volume(oi_usd) if oi_usd else "—"
         lines.append(
-            f"• *{coin}*: {arrow} `{r['change_pct']:+.2f}%` за 24ч"
+            f"• *{coin}*: `{oi_str}`"
         )
     lines.append("\n_Конкретная монета: `/oi BTC` или `/oi ETH`_")
     await _send_or_edit(target, "\n".join(lines), reply_markup=kb_market())
@@ -888,44 +880,6 @@ async def econ_calendar_job() -> None:
         log.exception("Econ calendar job error: %s", e)
 
 
-async def liq_monitor_job() -> None:
-    """Монитор крупных ликвидаций на Binance Futures."""
-    try:
-        now_ms = int(time.time() * 1000)
-        cutoff_ms = now_ms - config.LIQ_LOOKBACK_MINUTES * 60 * 1000
-        totals: dict[str, float] = {}
-        for rec in services._LIQ_HISTORY:
-            if rec["time"] < cutoff_ms:
-                continue
-            totals[rec["symbol"]] = totals.get(rec["symbol"], 0.0) + rec["usd"]
-        if not totals:
-            return
-        users = await db.all_morning_users()
-        if not users:
-            return
-        for sym, total_usd in totals.items():
-            if total_usd < config.LIQ_THRESHOLD_USD:
-                continue
-            if await db.recent_liq_alert(sym, cooldown_minutes=config.LIQ_COOLDOWN_MINUTES):
-                continue
-            await db.add_liq_alert(sym, total_usd, window_minutes=config.LIQ_LOOKBACK_MINUTES)
-            coin = services.symbol_to_coin(sym)
-            text = (
-                f"💥 *Крупные ликвидации за час*\n\n"
-                f"*{coin}*: `{services.fmt_volume(total_usd)}` за последние "
-                f"{config.LIQ_LOOKBACK_MINUTES} мин\n\n"
-                f"_Возможна повышенная волатильность._"
-            )
-            for uid in users:
-                try:
-                    await bot.send_message(uid, text)
-                except Exception as ex:
-                    log.warning("Failed to send liq alert to %s: %s", uid, ex)
-        log.info("Liq monitor job: %s symbols above threshold", len(totals))
-    except Exception as e:
-        log.exception("Liq monitor job error: %s", e)
-
-
 async def setup_scheduler() -> AsyncIOScheduler:
     global _scheduler
     sched = AsyncIOScheduler(timezone=config.TZ)
@@ -948,12 +902,6 @@ async def setup_scheduler() -> AsyncIOScheduler:
         econ_calendar_job,
         IntervalTrigger(minutes=10),
         id="econ_calendar",
-        replace_existing=True,
-    )
-    sched.add_job(
-        liq_monitor_job,
-        IntervalTrigger(minutes=5),
-        id="liq_monitor",
         replace_existing=True,
     )
     return sched
@@ -1077,9 +1025,9 @@ async def cb_news_coin(c: types.CallbackQuery, state: FSMContext) -> None:
         return
     # ALL — все новости без фильтра
     if coin == "ALL":
-        await _show_news(c, [])
+        await _show_news(c, [], lookback_hours=24)
         return
-    await _show_news(c, [coin])
+    await _show_news(c, [coin], lookback_hours=24)
 
 
 @router.message(NewsCustomCoin.waiting_coin)
@@ -1089,7 +1037,7 @@ async def news_custom_coin(m: types.Message, state: FSMContext) -> None:
     if not coin or not coin.isalpha():
         await m.answer("❌ Не похоже на тикер. Попробуй ещё раз, например `BTC`")
         return
-    await _show_news(m, [coin])
+    await _show_news(m, [coin], lookback_hours=24)
 
 
 # ─────────────────────────── Subscribe callbacks ────────────────
@@ -1236,8 +1184,6 @@ async def on_startup() -> None:
     global _scheduler, _health_runner
     log.info("Bot starting...")
     await db.init_db()
-    # WebSocket для ликвидаций (Binance)
-    await services.start_liq_websocket()
     _scheduler = await setup_scheduler()
     _scheduler.start()
     log.info(

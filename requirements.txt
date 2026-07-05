@@ -5,5 +5,3 @@ python-dotenv>=1.0
 feedparser>=6.0
 deep-translator>=1.11
 asyncpg>=0.29
-pydantic>=2.10
-websockets>=12.0

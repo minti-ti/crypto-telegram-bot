@@ -1,4 +1,13 @@
-"""Все клиенты к внешним API. Асинхронные, с таймаутом и обработкой ошибок."""
+"""Все клиенты к внешним API. Асинхронные, с таймаутом и обработкой ошибок.
+
+Источники данных:
+  - data-api.binance.vision — spot цены, 24ч тикеры (обходит блокировку EU)
+  - CoinGecko derivatives  — funding rate, open interest
+  - CoinGlass API           — ликвидации (требует COINGLASS_API_KEY)
+  - alternative.me          — Fear & Greed Index
+  - RSS + LLM / Google Translate — новости
+  - MQL5 / Finnhub          — экономический календарь
+"""
 from __future__ import annotations
 
 import asyncio
@@ -11,8 +20,6 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
-
-import websockets
 
 import aiohttp
 import feedparser  # type: ignore
@@ -29,6 +36,9 @@ log = logging.getLogger(__name__)
 
 TIMEOUT = aiohttp.ClientTimeout(total=20)
 HEADERS = {"User-Agent": "crypto-tg-bot/1.0"}
+
+# Binance spot (EU-safe mirror)
+BINANCE_SPOT = "https://data-api.binance.vision/api/v3"
 
 
 # ─────────────────────────── утилиты ───────────────────────────
@@ -87,13 +97,12 @@ def fear_greed_emoji(value: int) -> str:
     return "🤑 Extreme Greed"
 
 
-# ─────────────────────────── Binance: цены ──────────────────────
+# ─────────────────────────── Binance Spot: цены ─────────────────
 async def get_24h_tickers(
     session: aiohttp.ClientSession, symbols: list[str]
 ) -> dict[str, dict]:
-    data = await _get_json(
-        session, "https://fapi.binance.com/fapi/v1/ticker/24hr"
-    )
+    """Все 24ч тикеры со spot (data-api.binance.vision)."""
+    data = await _get_json(session, f"{BINANCE_SPOT}/ticker/24hr")
     if not data:
         return {}
     wanted = {s.upper() for s in symbols}
@@ -109,7 +118,7 @@ async def get_price(
 ) -> float | None:
     data = await _get_json(
         session,
-        "https://fapi.binance.com/fapi/v1/ticker/price",
+        f"{BINANCE_SPOT}/ticker/price",
         {"symbol": symbol.upper()},
     )
     if data and "price" in data:
@@ -120,96 +129,214 @@ async def get_price(
     return None
 
 
-# ─────────────────────────── Binance: funding ───────────────────
+# ─────────────────────────── CoinGecko derivatives ──────────────
+_COINGECKO_DERIV_CACHE: dict[str, Any] = {"data": None, "ts": 0.0}
+_COINGECKO_DERIV_TTL = 120  # секунд
+
+
+async def _get_coingecko_derivatives(session: aiohttp.ClientSession) -> list[dict]:
+    """Кэшированный запрос CoinGecko /derivatives."""
+    now = time.time()
+    if _COINGECKO_DERIV_CACHE["data"] and (now - _COINGECKO_DERIV_CACHE["ts"]) < _COINGECKO_DERIV_TTL:
+        return _COINGECKO_DERIV_CACHE["data"]
+
+    headers: dict[str, Any] = {}
+    if config.COINGECKO_API_KEY:
+        headers["x-cg-demo-api-key"] = config.COINGECKO_API_KEY
+
+    data = await _get_json(
+        session,
+        "https://api.coingecko.com/api/v3/derivatives",
+        headers=headers,
+    )
+    if data and isinstance(data, list):
+        _COINGECKO_DERIV_CACHE["data"] = data
+        _COINGECKO_DERIV_CACHE["ts"] = now
+        return data
+    return _COINGECKO_DERIV_CACHE["data"] or []
+
+
 async def get_funding_rate(
     session: aiohttp.ClientSession, symbol: str
 ) -> dict | None:
-    data = await _get_json(
-        session,
-        "https://fapi.binance.com/fapi/v1/premiumIndex",
-        {"symbol": symbol.upper()},
-    )
-    if not data:
-        return None
-    try:
-        return {
-            "symbol": data["symbol"],
-            "markPrice": float(data["markPrice"]),
-            "indexPrice": float(data["indexPrice"]),
-            "lastFundingRate": float(data["lastFundingRate"]),
-            "nextFundingTime": int(data["nextFundingTime"]),
-        }
-    except (KeyError, TypeError, ValueError):
+    """Funding rate через CoinGecko derivatives (Binance Futures)."""
+    coin = symbol_to_coin(symbol).upper()
+    derivs = await _get_coingecko_derivatives(session)
+    if not derivs:
         return None
 
+    # Ищем Binance Futures perpetual для нужной монеты
+    for d in derivs:
+        market = (d.get("market") or "").lower()
+        sym = (d.get("symbol") or "").upper().replace("_", "").replace("/", "")
+        contract = (d.get("contract_type") or "").lower()
+        if "binance" not in market:
+            continue
+        if contract != "perpetual":
+            continue
+        # Сравниваем символы: BTCUSDT, BTC_USDT, BTC/USDT → BTCUSDT
+        if sym in (symbol.upper(), f"{coin}USDT"):
+            try:
+                funding_raw = d.get("funding_rate")
+                # CoinGecko возвращает funding_rate в % (0.01 = 0.01%)
+                # Нужно перевести в дробный формат (0.0001)
+                if funding_raw is None:
+                    continue
+                funding_pct = float(funding_raw)
+                # CoinGecko: если значение > 1, это уже в % (напр. 0.01 = 0.01%)
+                # В Binance: 0.0001 = 0.01%
+                # CoinGecko даёт 0.01 как процент → делим на 100 для дробного
+                if abs(funding_pct) < 1:
+                    # Значение уже в процентах (0.01 = 0.01%)
+                    funding_frac = funding_pct / 100
+                else:
+                    funding_frac = funding_pct / 100
 
-# ─────────────────────────── Binance: Open Interest ───────────
+                price = float(d.get("price") or 0)
+                index_price = float(d.get("index") or 0)
+
+                # nextFundingTime: CoinGecko не даёт точное время,
+                # Binance funding каждые 8ч (00:00, 08:00, 16:00 UTC)
+                now_utc = datetime.now(timezone.utc)
+                next_hour = ((now_utc.hour // 8) + 1) * 8
+                next_dt = now_utc.replace(hour=next_hour % 24, minute=0, second=0, microsecond=0)
+                if next_hour >= 24:
+                    next_dt += timedelta(days=1)
+                next_funding_ms = int(next_dt.timestamp() * 1000)
+
+                return {
+                    "symbol": symbol.upper(),
+                    "markPrice": price,
+                    "indexPrice": index_price,
+                    "lastFundingRate": funding_frac,
+                    "nextFundingTime": next_funding_ms,
+                }
+            except (KeyError, TypeError, ValueError) as e:
+                log.debug("Funding parse error for %s: %s", symbol, e)
+                continue
+
+    # Fallback: любая биржа для этой монеты
+    for d in derivs:
+        sym = (d.get("symbol") or "").upper().replace("_", "").replace("/", "")
+        contract = (d.get("contract_type") or "").lower()
+        if contract != "perpetual":
+            continue
+        if sym in (symbol.upper(), f"{coin}USDT"):
+            try:
+                funding_raw = d.get("funding_rate")
+                if funding_raw is None:
+                    continue
+                funding_pct = float(funding_raw)
+                funding_frac = funding_pct / 100
+                price = float(d.get("price") or 0)
+                index_price = float(d.get("index") or 0)
+
+                now_utc = datetime.now(timezone.utc)
+                next_hour = ((now_utc.hour // 8) + 1) * 8
+                next_dt = now_utc.replace(hour=next_hour % 24, minute=0, second=0, microsecond=0)
+                if next_hour >= 24:
+                    next_dt += timedelta(days=1)
+                next_funding_ms = int(next_dt.timestamp() * 1000)
+
+                return {
+                    "symbol": symbol.upper(),
+                    "markPrice": price,
+                    "indexPrice": index_price,
+                    "lastFundingRate": funding_frac,
+                    "nextFundingTime": next_funding_ms,
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+    return None
+
+
+# ─────────────────────────── Open Interest ──────────────────────
 async def get_open_interest(
     session: aiohttp.ClientSession, symbol: str
 ) -> dict | None:
-    """
-    Текущий Open Interest по фьючерсу.
-    Возвращает {symbol, open_interest (в монетах), time}.
-    """
-    data = await _get_json(
-        session,
-        "https://fapi.binance.com/fapi/v1/openInterest",
-        {"symbol": symbol.upper()},
-    )
-    if not data:
+    """Open Interest через CoinGecko derivatives (в USD)."""
+    coin = symbol_to_coin(symbol).upper()
+    derivs = await _get_coingecko_derivatives(session)
+    if not derivs:
         return None
-    try:
-        return {
-            "symbol": data["symbol"],
-            "open_interest": float(data["openInterest"]),
-            "time": int(data["time"]),
-        }
-    except (KeyError, TypeError, ValueError):
-        return None
+
+    # Ищем Binance Futures
+    for d in derivs:
+        market = (d.get("market") or "").lower()
+        sym = (d.get("symbol") or "").upper().replace("_", "").replace("/", "")
+        contract = (d.get("contract_type") or "").lower()
+        if "binance" not in market or contract != "perpetual":
+            continue
+        if sym in (symbol.upper(), f"{coin}USDT"):
+            try:
+                oi_usd = float(d.get("open_interest") or 0)
+                if oi_usd <= 0:
+                    continue
+                price = float(d.get("price") or 0)
+                # Конвертируем USD → монеты
+                oi_coins = oi_usd / price if price > 0 else 0
+                return {
+                    "symbol": symbol.upper(),
+                    "open_interest": oi_coins,
+                    "open_interest_usd": oi_usd,
+                    "price": price,
+                    "time": int(time.time() * 1000),
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+
+    # Fallback: любая биржа
+    for d in derivs:
+        sym = (d.get("symbol") or "").upper().replace("_", "").replace("/", "")
+        contract = (d.get("contract_type") or "").lower()
+        if contract != "perpetual":
+            continue
+        if sym in (symbol.upper(), f"{coin}USDT"):
+            try:
+                oi_usd = float(d.get("open_interest") or 0)
+                if oi_usd <= 0:
+                    continue
+                price = float(d.get("price") or 0)
+                oi_coins = oi_usd / price if price > 0 else 0
+                return {
+                    "symbol": symbol.upper(),
+                    "open_interest": oi_coins,
+                    "open_interest_usd": oi_usd,
+                    "price": price,
+                    "time": int(time.time() * 1000),
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+    return None
 
 
 async def get_oi_change_24h(
     session: aiohttp.ClientSession, symbol: str
 ) -> dict | None:
     """
-    Изменение Open Interest за 24 часа.
-    Возвращает {current_oi, oi_24h_ago, change_pct, change_usd}.
+    Изменение Open Interest. CoinGecko не даёт историю,
+    поэтому показываем текущий OI и цену.
     """
     current = await get_open_interest(session, symbol)
     if not current:
         return None
-    end_ms = current["time"]
-    start_ms = end_ms - 24 * 3600 * 1000
-    hist = await _get_json(
-        session,
-        "https://fapi.binance.com/futures/data/openInterestHist",
-        {
-            "symbol": symbol.upper(),
-            "period": "5m",
-            "startTime": start_ms,
-            "endTime": end_ms,
-            "limit": 1,
-        },
-    )
-    if not hist or not isinstance(hist, list) or not hist:
-        return None
-    try:
-        old_oi = float(hist[0]["sumOpenInterest"])
-    except (KeyError, TypeError, ValueError, IndexError):
-        return None
-    if old_oi <= 0:
-        return None
-    change = current["open_interest"] - old_oi
-    change_pct = (change / old_oi) * 100
-    price = await get_price(session, symbol)
-    change_usd = change * price if price else None
+
+    price = current.get("price")
+    if not price:
+        price = await get_price(session, symbol)
+
+    oi_usd = current.get("open_interest_usd")
+    if not oi_usd:
+        oi_usd = current["open_interest"] * price if price else None
+
     return {
         "current_oi": current["open_interest"],
-        "oi_24h_ago": old_oi,
-        "change": change,
-        "change_pct": change_pct,
-        "change_usd": change_usd,
+        "oi_24h_ago": None,
+        "change": None,
+        "change_pct": None,
+        "change_usd": None,
         "price": price,
+        "oi_usd": oi_usd,
     }
 
 
@@ -623,8 +750,6 @@ async def fetch_mql5_calendar(
 
     log.info("MQL5 calendar: fetched HTML length %s", len(text))
 
-    # MQL5 рендерит события в div'ах вида:
-    # <div class="ec-table__item ec-table__item_inline">2026.06.17 18:00, USD, <a href="...">FOMC Statement</a></div>
     events: list[dict] = []
     pattern = re.compile(
         r'<div class="ec-table__item ec-table__item_inline">'
@@ -633,13 +758,10 @@ async def fetch_mql5_calendar(
     )
     for m in pattern.finditer(text):
         date_str, time_str, currency, rest = m.groups()
-        # Извлекаем название события из ссылки
         name_match = re.search(r'<a[^>]*>(.*?)</a>', rest)
         event_name = name_match.group(1) if name_match else rest
-        # Убираем HTML-теги
         event_name = html.unescape(re.sub(r'<[^>]+>', '', event_name)).strip()
 
-        # Парсим Actual/Forecast/Previous из rest
         actual = estimate = previous = ""
         for label in ("Actual:", "Forecast:", "Previous:"):
             if label in rest:
@@ -656,7 +778,6 @@ async def fetch_mql5_calendar(
                 elif label == "Previous:":
                     previous = val
 
-        # Переводим дату в YYYY-MM-DD
         try:
             dt = datetime.strptime(date_str, "%Y.%m.%d")
             iso_date = dt.strftime("%Y-%m-%d")
@@ -671,10 +792,9 @@ async def fetch_mql5_calendar(
             "actual": actual or None,
             "estimate": estimate or None,
             "previous": previous or None,
-            "impact": "",  # MQL5 не даёт impact
+            "impact": "",
         })
 
-    # Фильтруем по датам
     out = [e for e in events if from_date <= e["date"] <= to_date]
     log.info("MQL5 calendar: parsed %s events, filtered %s", len(events), len(out))
     return out
@@ -693,7 +813,6 @@ async def _translate_events(events: list[dict]) -> list[dict]:
     try:
         loop = asyncio.get_running_loop()
         names = [e.get("event", "") for e in events]
-        # Пробуем пакетный перевод
         try:
             translated = await loop.run_in_executor(
                 None,
@@ -736,8 +855,6 @@ def _filter_us_macro_events(events: list[dict]) -> list[dict]:
             continue
         event_name = (e.get("event") or "").upper()
 
-        # impact у Finnhub — строка "1" / "2" / "3" (1=low, 2=medium, 3=high)
-        # у MQL5 impact нет, считаем его неизвестным
         impact_raw = e.get("impact")
         impact_val = 0
         if isinstance(impact_raw, (int, float)):
@@ -749,12 +866,10 @@ def _filter_us_macro_events(events: list[dict]) -> list[dict]:
             else:
                 impact_val = {"low": 1, "medium": 2, "high": 3}.get(impact_raw, 0)
 
-        # Важные ключевые слова — всегда пропускаем
         if any(kw in event_name for kw in US_ECON_KEYWORDS):
             out.append(e)
             continue
 
-        # Если impact известен и достаточно высокий — тоже пропускаем
         if impact_val >= config.ECON_MIN_IMPORTANCE:
             out.append(e)
     return out
@@ -804,8 +919,6 @@ def _fmt_event(e: dict) -> str:
     return "\n".join(parts)
 
 
-
-
 async def build_econ_calendar_text(days: int = 1) -> str:
     """Собрать текст календаря на ближайшие дни: предстоящие, важные, на русском, MSK."""
     now = datetime.now(timezone.utc)
@@ -851,101 +964,116 @@ async def get_upcoming_macro_events(
     return out
 
 
-# ─────────────────────────── ликвидации (Binance WebSocket) ─────
+# ─────────────────────────── ликвидации (CoinGlass API) ─────────
 _LIQ_HISTORY: deque[dict] = deque()
 _LIQ_MAX_AGE_HOURS = 24
 
 
-def _add_liq_event(symbol: str, time_ms: int, usd: float) -> None:
-    """Сохранить ликвидацию в памяти, если символ из нужных."""
-    wanted = {s.upper() for s in config.LIQ_SYMBOLS}
-    if symbol.upper() not in wanted:
-        return
-    _LIQ_HISTORY.append({"symbol": symbol.upper(), "time": time_ms, "usd": usd})
-    cutoff_ms = int(time.time() * 1000) - _LIQ_MAX_AGE_HOURS * 3600 * 1000
-    while _LIQ_HISTORY and _LIQ_HISTORY[0]["time"] < cutoff_ms:
-        _LIQ_HISTORY.popleft()
+async def fetch_liquidations(
+    session: aiohttp.ClientSession,
+    hours: int = 24,
+) -> dict[str, dict]:
+    """
+    Получает ликвидации через CoinGlass API.
+    Возвращает {symbol: {total_usd, long_usd, short_usd, data: [...]}}
+    """
+    if not config.COINGLASS_API_KEY:
+        return {}
 
+    results: dict[str, dict] = {}
+    symbols = config.LIQ_SYMBOLS
 
-async def _liq_websocket_loop() -> None:
-    """WebSocket-логгер ликвидаций Binance Futures. Переподключается при обрыве."""
-    url = "wss://fstream.binance.com/ws/!forceOrder@arr"
-    while True:
+    for sym in symbols:
+        coin = symbol_to_coin(sym)
         try:
-            log.info("Connecting to Binance liquidation websocket: %s", url)
-            async with websockets.connect(url) as ws:
-                async for raw in ws:
-                    try:
-                        data = json.loads(raw)
-                        if data.get("e") != "forceOrder":
-                            continue
-                        o = data.get("o", {})
-                        symbol = (o.get("s") or "").upper()
-                        if not symbol:
-                            continue
-                        time_ms = int(data.get("E") or time.time() * 1000)
-                        qty = float(o.get("z") or o.get("q") or 0)
-                        price = float(o.get("ap") or o.get("p") or 0)
-                        if qty <= 0 or price <= 0:
-                            continue
-                        usd = qty * price
-                        _add_liq_event(symbol, time_ms, usd)
-                    except Exception as e:
-                        log.warning("Liq websocket parse error: %s", e)
+            data = await _get_json(
+                session,
+                "https://open-api.coinglass.com/public/v2/liquidation_history",
+                {
+                    "symbol": coin,
+                    "time_type": "2",  # 2 = hours
+                    "time": str(hours),
+                },
+                headers={"CG-API-KEY": config.COINGLASS_API_KEY},
+            )
+            if not data or not data.get("success") or not data.get("data"):
+                log.warning("CoinGlass: no data for %s", coin)
+                continue
+
+            items = data["data"]
+            if not isinstance(items, list):
+                # data может быть dict с volUsd
+                if isinstance(items, dict):
+                    total_usd = float(items.get("volUsd") or 0)
+                    long_usd = float(items.get("longVolUsd") or 0)
+                    short_usd = float(items.get("shortVolUsd") or 0)
+                    results[sym.upper()] = {
+                        "total_usd": total_usd,
+                        "long_usd": long_usd,
+                        "short_usd": short_usd,
+                    }
+                continue
+
+            total_usd = 0.0
+            long_usd = 0.0
+            short_usd = 0.0
+            for item in items:
+                vol = float(item.get("volUsd") or 0)
+                total_usd += vol
+                # CoinGlass: longVolUsd / shortVolUsd
+                long_usd += float(item.get("longVolUsd") or 0)
+                short_usd += float(item.get("shortVolUsd") or 0)
+
+            results[sym.upper()] = {
+                "total_usd": total_usd,
+                "long_usd": long_usd,
+                "short_usd": short_usd,
+            }
+
         except Exception as e:
-            log.warning("Liq websocket connection error: %s", e)
-            await asyncio.sleep(5)
+            log.warning("CoinGlass error for %s: %s", coin, e)
 
-
-async def start_liq_websocket() -> None:
-    """Запускает фоновый WebSocket для ликвидаций."""
-    asyncio.create_task(_liq_websocket_loop())
-    log.info("Liquidation websocket started")
-
-
-def _aggregate_liq_history(
-    hours: int,
-    bucket_hours: int = 6,
-) -> tuple[dict[tuple[str, int], float], dict[str, float]]:
-    """Группировка ликвидаций из памяти."""
-    now_ms = int(time.time() * 1000)
-    cutoff_ms = now_ms - hours * 3600 * 1000
-    bucket_ms = bucket_hours * 3600 * 1000
-    buckets: dict[tuple[str, int], float] = {}
-    totals: dict[str, float] = {}
-    for rec in _LIQ_HISTORY:
-        if rec["time"] < cutoff_ms:
-            continue
-        sym = rec["symbol"]
-        bucket_idx = int((now_ms - rec["time"]) // bucket_ms)
-        key = (sym, bucket_idx)
-        buckets[key] = buckets.get(key, 0.0) + rec["usd"]
-        totals[sym] = totals.get(sym, 0.0) + rec["usd"]
-    return buckets, totals
+    return results
 
 
 async def build_liquidations_text(hours: int = 24) -> str:
-    """Текст с ликвидациями за последние hours часов с разбивкой по интервалам."""
-    buckets, totals = _aggregate_liq_history(hours, bucket_hours=6)
-    if not totals:
+    """Текст с ликвидациями за последние hours часов через CoinGlass."""
+    async with _shared_session() as s:
+        data = await fetch_liquidations(s, hours=hours)
+
+    if not data:
+        if not config.COINGLASS_API_KEY:
+            return (
+                "💥 *Ликвидации*\n\n"
+                "⚠️ Не задан `COINGLASS_API_KEY` в `.env`.\n"
+                "Получи бесплатный ключ на [coinglass.com/api](https://www.coinglass.com/pro/futures/LiquidationInfo)\n\n"
+                "_Без ключа данные о ликвидациях недоступны._"
+            )
         return (
             f"💥 *Ликвидации за {hours}ч*\n\n"
             f"Нет данных по `{', '.join(config.LIQ_SYMBOLS)}`.\n"
-            "_Данные собираются через WebSocket, подожди немного._"
+            "_Попробуй позже._"
         )
-    labels = ["0-6ч", "6-12ч", "12-18ч", "18-24ч"]
+
     lines = [f"💥 *Ликвидации за {hours}ч*\n"]
     total_all = 0.0
-    for sym in sorted(totals, key=totals.get, reverse=True):
-        val = totals[sym]
-        total_all += val
+    for sym in sorted(data, key=lambda s: data[s]["total_usd"], reverse=True):
+        info = data[sym]
+        total = info["total_usd"]
+        total_all += total
         coin = symbol_to_coin(sym)
-        lines.append(f"*{coin}* — всего `{fmt_volume(val)}`")
-        for idx, label in enumerate(labels):
-            bucket_val = buckets.get((sym, idx), 0.0)
-            lines.append(f"  {label}: `{fmt_volume(bucket_val)}`")
+        long_usd = info.get("long_usd", 0)
+        short_usd = info.get("short_usd", 0)
+
+        lines.append(f"*{coin}* — всего `{fmt_volume(total)}`")
+        if long_usd or short_usd:
+            lines.append(f"  🟢 Лонги: `{fmt_volume(long_usd)}`")
+            lines.append(f"  🔴 Шорты: `{fmt_volume(short_usd)}`")
         lines.append("")
-    lines.append(f"_Всего: {fmt_volume(total_all)}_")
+
+    if total_all > 0:
+        lines.append(f"_Всего: {fmt_volume(total_all)}_")
+
     return "\n".join(lines)
 
 
