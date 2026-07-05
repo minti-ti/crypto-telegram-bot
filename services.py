@@ -471,6 +471,39 @@ NEWS_LLM_SYSTEM = (
 )
 
 
+async def _filter_news_heuristic(
+    items: list[dict], target_coins: list[str] | None = None,
+) -> list[dict]:
+    """Fallback-фильтр важных новостей без LLM.
+    Используется, если OpenRouter не задан/упал/вернул невалидный JSON.
+    """
+    out: list[dict] = []
+    target_set = {c.upper() for c in (target_coins or [])}
+    candidates: list[tuple[dict, list[str], str, str]] = []
+    for it in items[:config.NEWS_MAX_PER_LLM]:
+        title = it.get("title", "")
+        is_important, importance, reason = _classify_news_importance(title)
+        if not is_important:
+            continue
+        coins = _extract_coins_from_text(title)
+        # Для конкретной монеты показываем новости по ней + обще-рыночные.
+        if target_set and coins and not (set(coins) & target_set):
+            continue
+        candidates.append((it, coins, importance, reason))
+
+    translations = await _translate_titles([it["title"] for it, *_ in candidates])
+    for (it, coins, importance, reason), title_ru in zip(candidates, translations):
+        out.append({
+            **it,
+            "coins": coins,
+            "reason": reason,
+            "importance": importance,
+            "title_ru": title_ru,
+        })
+    out.sort(key=lambda x: (0 if x.get("importance") == "high" else 1, -(x.get("ts") or 0)))
+    return out[:8]
+
+
 async def filter_news_with_llm(
     items: list[dict], target_coins: list[str] | None = None,
 ) -> list[dict]:
@@ -478,36 +511,9 @@ async def filter_news_with_llm(
         return []
 
     if not config.OPENROUTER_API_KEY:
-        # Fallback без LLM: НЕ шлём весь RSS, а оставляем только важные события
-        # по правилам (регуляторы, ETF, взломы, крупные листинги, макро и т.п.)
-        # и переводим заголовки на русский.
-        out: list[dict] = []
-        target_set = {c.upper() for c in (target_coins or [])}
-        candidates: list[tuple[dict, list[str], str, str]] = []
-        for it in items[:config.NEWS_MAX_PER_LLM]:
-            title = it.get("title", "")
-            is_important, importance, reason = _classify_news_importance(title)
-            if not is_important:
-                continue
-            coins = _extract_coins_from_text(title)
-            # Если пользователь запросил конкретные монеты — показываем:
-            # 1) новости по этим монетам, 2) обще-рыночные новости без конкретного тикера.
-            if target_set and coins and not (set(coins) & target_set):
-                continue
-            candidates.append((it, coins, importance, reason))
+        # Без LLM используем строгий локальный фильтр, а не весь RSS.
+        return await _filter_news_heuristic(items, target_coins)
 
-        translations = await _translate_titles([it["title"] for it, *_ in candidates])
-        for (it, coins, importance, reason), title_ru in zip(candidates, translations):
-            out.append({
-                **it,
-                "coins": coins,
-                "reason": reason,
-                "importance": importance,
-                "title_ru": title_ru,
-            })
-        # Ограничиваемся самыми свежими/важными, чтобы бот не превращался в RSS-ленту.
-        out.sort(key=lambda x: (0 if x.get("importance") == "high" else 1, -(x.get("ts") or 0)))
-        return out[:8]
 
     payload_items = [
         {
@@ -545,11 +551,11 @@ async def filter_news_with_llm(
             ) as r:
                 if r.status >= 400:
                     log.warning("OpenRouter HTTP %s: %s", r.status, await r.text())
-                    return []
+                    return await _filter_news_heuristic(items, target_coins)
                 data = await r.json()
     except Exception as e:
         log.warning("OpenRouter error: %s", e)
-        return []
+        return await _filter_news_heuristic(items, target_coins)
 
     content = (
         data.get("choices", [{}])[0]
@@ -563,7 +569,7 @@ async def filter_news_with_llm(
         filtered = json.loads(content)
     except Exception as e:
         log.warning("OpenRouter JSON parse error: %s; raw: %s", e, content[:200])
-        return []
+        return await _filter_news_heuristic(items, target_coins)
 
     by_url = {it["url"]: it for it in items}
     out: list[dict] = []
@@ -588,7 +594,9 @@ async def filter_news_with_llm(
             "importance": f.get("importance", "medium"),
             "title_ru": title_ru,
         })
-    return out
+    if out:
+        return out[:8]
+    return await _filter_news_heuristic(items, target_coins)
 
 
 async def _translate_titles(titles: list[str]) -> list[str]:
@@ -772,11 +780,14 @@ US_ECON_KEYWORDS = (
     "CPI", "NFP", "NONFARM", "FOMC", "FED", "GDP", "PPI",
     "UNEMPLOYMENT", "INTEREST RATE", "JOBLESS", "EMPLOYMENT",
     "INFLATION", "RETAIL SALES", "INDUSTRIAL PRODUCTION",
+    "PMI", "ISM", "SERVICES", "MANUFACTURING", "JOLTS", "PAYROLL",
 )
 
 HIGH_IMPACT_KEYWORDS = (
     "CPI", "NFP", "NONFARM", "FOMC", "FED INTEREST RATE", "GDP", "PPI",
     "UNEMPLOYMENT RATE", "RETAIL SALES", "CORE RETAIL SALES",
+    "ISM NON-MANUFACTURING", "ISM MANUFACTURING", "S&P GLOBAL SERVICES PMI",
+    "S&P GLOBAL COMPOSITE PMI", "JOLTS", "FED GOVERNOR", "FED CHAIR", "FED SPEECH",
 )
 
 
@@ -1008,18 +1019,27 @@ async def build_econ_calendar_text(days: int = 1) -> str:
     events = _filter_us_macro_events(events)
     # Только предстоящие
     events = [e for e in events if _parse_event_datetime(e) and _parse_event_datetime(e) > now]
-    # Только самые важные
-    events = [e for e in events if _is_high_impact_event(e.get("event", ""))]
     if not events:
-        return "📅 *Нет важных предстоящих US-событий на ближайшие дни.*"
+        return "📅 *Нет предстоящих US macro-событий на ближайшие дни.*"
+
+    # Сначала показываем самые важные. Если их нет — показываем ближайшие
+    # средне-важные USD-события, чтобы календарь не выглядел пустым.
+    high_events = [e for e in events if _is_high_impact_event(e.get("event", ""))]
+    title = "📅 *Важные предстоящие US-события (MSK)*\n"
+    if high_events:
+        events = high_events
+    else:
+        title = "📅 *Ближайшие US macro-события (MSK)*\n"
+
     # Сортировка по времени
     events.sort(key=lambda e: _parse_event_datetime(e) or datetime.min.replace(tzinfo=timezone.utc))
     # Перевод на русский
     events = await _translate_events(events)
-    lines = [f"📅 *Важные предстоящие US-события (MSK)*\n"]
-    for e in events[:20]:
+    lines = [title]
+    for e in events[:12]:
         lines.append(_fmt_event(e))
     return "\n\n".join(lines)
+
 
 
 async def get_upcoming_macro_events(
